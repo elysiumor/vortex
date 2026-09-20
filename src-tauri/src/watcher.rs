@@ -78,5 +78,9 @@ fn run(app: AppHandle) {
 }
 
 fn is_video_or_dir(p: &Path) -> bool {
+    // Torrent pieces land in `.incomplete`; a scan per piece would be wasteful.
+    if p.components().any(|c| c.as_os_str() == crate::torrent::STAGING_DIR) {
+        return false;
+    }
     p.extension().is_none() || crate::parser::is_video(p)
 }

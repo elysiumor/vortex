@@ -64,7 +64,7 @@ const MIN_FILE_BYTES: u64 = 20 * 1024 * 1024; // skip tiny clips and samples
 pub const DEFAULT_IGNORED_DIRS: &[&str] = &[
     "windows", "program files", "program files (x86)", "programdata", "appdata", "$recycle.bin",
     "system volume information", "recovery", "perflogs", "node_modules", ".git", "$windows.~bt",
-    "windows.old", "msocache", "steamapps", "cache", ".cache", "temp", "tmp",
+    "windows.old", "msocache", "steamapps", "cache", ".cache", "temp", "tmp", ".incomplete",
 ];
 
 pub fn ignored_dirs(conn: &Connection) -> Vec<String> {

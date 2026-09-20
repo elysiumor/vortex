@@ -3,7 +3,7 @@ import { onMounted, onUnmounted, ref } from "vue";
 import { toast } from "vue-sonner";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { FolderPlus, HardDrive, RefreshCw, Trash2, Check, Download, Upload, Sun, Moon, Monitor, KeyRound, Power } from "@lucide/vue";
-import { api, type DetectedPlayer, type Drive, type Library, type PosterProgress, type ScanStats } from "../lib/api";
+import { api, type DetectedPlayer, type Drive, type Library, type PosterProgress, type ScanStats, type TorrentStatus } from "../lib/api";
 import { applyTheme, loadTheme, type Theme } from "../lib/theme";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -106,6 +106,31 @@ async function browsePlayer() {
 }
 async function savePlayer() { await api.setSetting("player_kind", playerKind.value); await api.setSetting("player_path", playerPath.value); toast.success("Player saved"); }
 
+// ---- downloads ----
+const torrentDir = ref("");
+const torrentProxy = ref("");
+const torrentDown = ref("");
+const torrentUp = ref("");
+const torrentStatus = ref<TorrentStatus | null>(null);
+const torrentBusy = ref(false);
+const magnetHandler = ref(false);
+async function setMagnetHandler(on: boolean) {
+  magnetHandler.value = on;
+  try { await api.setMagnetHandler(on); toast.success(on ? "Vortex now opens magnet links" : "Magnet links released"); }
+  catch (e) { magnetHandler.value = !on; toast.error(String(e)); }
+}
+async function saveTorrent() {
+  torrentBusy.value = true;
+  try {
+    await api.setSetting("torrent_dir", torrentDir.value);
+    await api.setSetting("torrent_proxy", torrentProxy.value.trim());
+    await api.setSetting("torrent_down_kbps", torrentDown.value.trim());
+    await api.setSetting("torrent_up_kbps", torrentUp.value.trim());
+    torrentStatus.value = await api.torrentRestart();
+    if (torrentStatus.value.error) toast.error(torrentStatus.value.error); else toast.success("Download settings applied");
+  } catch (e) { toast.error(String(e)); } finally { torrentBusy.value = false; }
+}
+
 // ---- backup / reset ----
 const lastBackup = ref("");
 const lastBackupPath = ref("");
@@ -139,6 +164,10 @@ async function load() {
   lastBackup.value = s.last_backup ?? ""; lastBackupPath.value = s.last_backup_path ?? "";
   for (const k of Object.keys(flags.value)) if (s[k] !== undefined) flags.value[k] = s[k] === "1";
   ffprobePath.value = s.ffprobe_path ?? ""; ffprobeDetected.value = await api.detectFfprobe();
+  torrentDir.value = s.torrent_dir ?? ""; torrentProxy.value = s.torrent_proxy ?? "";
+  torrentDown.value = s.torrent_down_kbps ?? ""; torrentUp.value = s.torrent_up_kbps ?? "";
+  torrentStatus.value = await api.torrentStatus().catch(() => null);
+  magnetHandler.value = s.magnet_handler === "1";
 }
 
 const unlisteners: (() => void)[] = [];
@@ -211,6 +240,41 @@ onUnmounted(() => unlisteners.forEach((u) => u()));
           </Select>
         </div>
         <p class="text-xs text-destructive" v-if="!playerPath">No player selected. Files open with the Windows default app and progress is not tracked.</p>
+      </CardContent>
+    </Card>
+
+    <Card>
+      <CardHeader><CardTitle>Downloads</CardTitle><CardDescription>Paste magnet links or open .torrent files on the Downloads page; Vortex never searches for content. Finished downloads move into the library folder chosen here and show up like any other file.</CardDescription></CardHeader>
+      <CardContent class="space-y-3">
+        <div>
+          <div class="mb-1 text-sm font-medium">Default "Save in" folder</div>
+          <Select v-model="torrentDir">
+            <SelectTrigger class="w-full"><SelectValue placeholder="Choose a library folder" /></SelectTrigger>
+            <SelectContent><SelectItem v-for="lib in libraries" :key="lib.id" :value="lib.path">{{ lib.path }}</SelectItem></SelectContent>
+          </Select>
+          <div class="mt-1 text-xs text-muted-foreground">{{ libraries.length ? "Each download can still pick any folder and whether to create a subfolder." : "Add a library folder first." }}</div>
+        </div>
+        <div>
+          <div class="mb-1 text-sm font-medium">SOCKS5 proxy</div>
+          <Input v-model="torrentProxy" placeholder="socks5://user:pass@host:1080 — leave empty for none" />
+          <div class="mt-1 text-xs text-muted-foreground">With a proxy every connection goes through it; DHT, UDP trackers and incoming connections are switched off because they cannot. Most VPN providers offer a SOCKS5 endpoint that only answers inside the tunnel, which makes it a kill switch as well. Without one, peers see your real IP address.</div>
+        </div>
+        <div class="flex items-center justify-between gap-4">
+          <div><div class="text-sm font-medium">Open magnet links with Vortex</div><div class="text-xs text-muted-foreground">Clicking a magnet link in your browser brings Vortex up and streams it. Takes the association from whichever client had it; switch off to give it back.</div></div>
+          <Switch :model-value="magnetHandler" @update:model-value="(v: boolean) => setMagnetHandler(v)" />
+        </div>
+        <div class="flex gap-3">
+          <div class="flex-1"><div class="mb-1 text-sm font-medium">Download limit (KB/s)</div><Input v-model="torrentDown" placeholder="0 = unlimited" /></div>
+          <div class="flex-1"><div class="mb-1 text-sm font-medium">Upload limit (KB/s)</div><Input v-model="torrentUp" placeholder="0 = unlimited" /></div>
+        </div>
+        <div class="flex items-center gap-3">
+          <Button :disabled="torrentBusy" @click="saveTorrent"><RefreshCw :class="{ 'animate-spin': torrentBusy }" /> Apply</Button>
+          <span class="text-xs" v-if="torrentStatus">
+            <span v-if="torrentStatus.running && torrentStatus.protected" class="text-emerald-600 dark:text-emerald-400">Running, protected via proxy.</span>
+            <span v-else-if="torrentStatus.running" class="text-amber-600 dark:text-amber-400">Running unprotected: your IP is visible to peers.</span>
+            <span v-else class="text-muted-foreground">{{ torrentStatus.error ?? "Not running." }}</span>
+          </span>
+        </div>
       </CardContent>
     </Card>
 

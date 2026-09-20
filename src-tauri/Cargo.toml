@@ -27,6 +27,8 @@ walkdir = "2"
 regex = "1"
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
+tauri-plugin-deep-link = "2"
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 urlencoding = "2"
 sysinfo = "0.33"
@@ -36,6 +38,13 @@ trash = "5"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 notify = "8"
 notify-debouncer-mini = "0.6"
+librqbit = { version = "9", default-features = false, features = ["http-api", "tracing-subscriber-utils"] }
+# SHA-1 via the Windows crypto API and TLS via schannel: keeps aws-lc-sys (needs CMake + NASM) out of the build.
+librqbit-core = { version = "9", default-features = false, features = ["sha1-crypto-hash"] }
+reqwest13 = { package = "reqwest", version = "0.13", default-features = false, features = ["native-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+anyhow = "1"
+librqbit-dualstack-sockets = "0.7"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }

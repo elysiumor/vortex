@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 import { Toaster, toast } from "vue-sonner";
-import { Home, Film, Tv, Layers, History, Copy, BarChart3, Settings, Search, Sparkles, X, Play, Trash2 } from "@lucide/vue";
+import { Home, Film, Tv, Layers, History, Copy, BarChart3, Settings, Search, Sparkles, X, Play, Trash2, Download } from "@lucide/vue";
 import { api, type SmartList } from "./lib/api";
 import { hms } from "./lib/format";
 import { Button } from "@/components/ui/button";
@@ -16,8 +16,9 @@ import HistoryView from "./components/HistoryView.vue";
 import DuplicatesView from "./components/DuplicatesView.vue";
 import CollectionsView from "./components/CollectionsView.vue";
 import StatsView from "./components/StatsView.vue";
+import DownloadsView from "./components/DownloadsView.vue";
 
-type Page = "home" | "movies" | "series" | "collections" | "history" | "duplicates" | "stats" | "settings" | "smart";
+type Page = "home" | "movies" | "series" | "collections" | "history" | "duplicates" | "stats" | "downloads" | "settings" | "smart";
 const page = ref<Page>("home");
 const openId = ref<number | null>(null);
 const cameFrom = ref<Page>("home");
@@ -34,6 +35,7 @@ const history = ref<InstanceType<typeof HistoryView>>();
 const duplicates = ref<InstanceType<typeof DuplicatesView>>();
 const collectionsRef = ref<InstanceType<typeof CollectionsView>>();
 const statsRef = ref<InstanceType<typeof StatsView>>();
+const downloadsRef = ref<InstanceType<typeof DownloadsView>>();
 
 const nav = computed(() => [
   { id: "home" as Page, label: "Home", icon: Home },
@@ -42,6 +44,7 @@ const nav = computed(() => [
   { id: "collections" as Page, label: "Collections", icon: Layers },
   { id: "history" as Page, label: "History", icon: History },
   { id: "stats" as Page, label: "Statistics", icon: BarChart3 },
+  { id: "downloads" as Page, label: "Downloads", icon: Download },
   { id: "duplicates" as Page, label: "Duplicates", icon: Copy, count: dupCount.value },
 ]);
 
@@ -180,7 +183,7 @@ onMounted(async () => {
       if (s.renamed) parts.push(`${s.renamed} renamed`);
       if (s.removed) parts.push(`${s.removed} removed`);
       if (s.extras) parts.push(`${s.extras} extras`);
-      const why = p.reason === "watch" ? "Folder change" : p.reason === "drive" ? "Drive connected" : "Rescan";
+      const why = p.reason === "watch" ? "Folder change" : p.reason === "drive" ? "Drive connected" : p.reason === "torrent" ? "Download finished" : "Rescan";
       toast(`${why}: ${parts.join(", ")}`);
     }
     refreshAll();
@@ -188,6 +191,17 @@ onMounted(async () => {
   unlisteners.push(await api.onLibraryRestored(() => { openId.value = null; refreshAll(); }));
   unlisteners.push(await api.onDurationsDone((p) => { if (p.found > 0) refreshAll(); }));
   unlisteners.push(await api.onPostersDone(() => refreshAll()));
+  // magnet: links clicked in a browser: jump to Downloads and stream.
+  const openMagnet = async (m: string) => {
+    go("downloads");
+    await nextTick();
+    await downloadsRef.value?.streamFrom(m);
+  };
+  unlisteners.push(await api.onOpenUrl(openMagnet));
+  for (const m of await api.pendingOpenUrls()) await openMagnet(m);
+  unlisteners.push(await api.onTorrentDone((p) => {
+    toast.success(p.moved.length ? `Download finished: ${p.name}` : `Download finished: ${p.name} (files stayed in .incomplete)`);
+  }));
 });
 onUnmounted(() => unlisteners.forEach((u) => u()));
 </script>
@@ -248,6 +262,7 @@ onUnmounted(() => unlisteners.forEach((u) => u()));
           <HistoryView v-else-if="page === 'history'" ref="history" @open="openItem" />
           <StatsView v-else-if="page === 'stats'" ref="statsRef" @open="openItem" />
           <DuplicatesView v-else-if="page === 'duplicates'" ref="duplicates" @open="openItem" />
+          <DownloadsView v-else-if="page === 'downloads'" ref="downloadsRef" @go="go" />
           <SettingsView v-else @scanned="onScanned" />
         </div>
       </main>
