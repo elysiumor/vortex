@@ -1,12 +1,14 @@
 mod backup;
 mod commands;
 mod db;
+mod deeplink;
 mod jobs;
 mod parser;
 mod player;
 mod probe;
 mod scanner;
 mod tmdb;
+mod torrent;
 mod tray;
 mod watcher;
 
@@ -21,11 +23,18 @@ pub struct AppState {
     pub probing: AtomicBool,
     pub scanning: AtomicBool,
     pub rescan_wanted: AtomicBool,
+    pub torrent: Mutex<Option<std::sync::Arc<torrent::Engine>>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Must come first: a second launch (e.g. from a magnet link) hands its
+        // arguments to the running instance, which the deep-link plugin picks up.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            tray::show_window(app);
+        }))
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
@@ -54,6 +63,7 @@ pub fn run() {
                 probing: AtomicBool::new(false),
                 scanning: AtomicBool::new(false),
                 rescan_wanted: AtomicBool::new(false),
+                torrent: Mutex::new(None),
             });
 
             let handle = app.handle().clone();
@@ -63,7 +73,15 @@ pub fn run() {
             } else {
                 let _ = probe::probe_missing(handle.clone());
             }
-            watcher::start(handle);
+            // Downloads left running last time carry on in the background.
+            if torrent::has_saved_session(&handle) {
+                let h = handle.clone();
+                std::thread::spawn(move || {
+                    let _ = torrent::ensure(&h);
+                });
+            }
+            watcher::start(handle.clone());
+            deeplink::setup(&handle)?;
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -130,6 +148,23 @@ pub fn run() {
             commands::get_settings,
             commands::set_setting,
             commands::quit_app,
+            commands::torrent_status,
+            commands::torrent_restart,
+            commands::torrent_inspect,
+            commands::torrent_add,
+            commands::torrent_list,
+            commands::torrent_pause,
+            commands::torrent_resume,
+            commands::torrent_remove,
+            commands::torrent_play,
+            commands::torrent_detail,
+            commands::torrent_session_status,
+            commands::torrent_stream,
+            commands::torrent_stream_existing,
+            commands::torrent_keep,
+            commands::torrent_discard,
+            commands::set_magnet_handler,
+            commands::pending_open_urls,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

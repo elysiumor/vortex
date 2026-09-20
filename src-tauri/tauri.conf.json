@@ -25,6 +25,13 @@
       }
     }
   },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["vortex"]
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",

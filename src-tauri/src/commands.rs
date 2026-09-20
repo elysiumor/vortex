@@ -6,6 +6,7 @@ use crate::probe;
 use crate::backup::{self, BackupInfo};
 use crate::scanner::{self, ScanStats};
 use crate::tmdb::{self, Details, TmdbMatch};
+use crate::torrent;
 use crate::AppState;
 use std::collections::HashMap;
 use tauri::{AppHandle, Manager, State};
@@ -455,4 +456,111 @@ pub fn get_settings(state: State<AppState>) -> R<HashMap<String, String>> {
 pub fn set_setting(state: State<AppState>, key: String, value: String) -> R<()> {
     let conn = state.db.lock().map_err(err)?;
     db::set_setting(&conn, &key, &value).map_err(err)
+}
+
+// ---- torrents ----
+
+/// Starts the engine when a download folder is configured, so the Downloads
+/// page shows live state as soon as it opens.
+#[tauri::command]
+pub async fn torrent_status(app: AppHandle) -> R<torrent::Status> {
+    blocking(move || {
+        let error = if torrent::read_config(&app).dir.is_empty() { None } else { torrent::ensure(&app).err() };
+        Ok(torrent::status(&app, error))
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn torrent_restart(app: AppHandle) -> R<torrent::Status> {
+    blocking(move || torrent::restart(&app)).await
+}
+
+#[tauri::command]
+pub async fn torrent_inspect(app: AppHandle, source: String) -> R<torrent::Preview> {
+    blocking(move || torrent::ensure(&app)?.inspect(&source)).await
+}
+
+#[tauri::command]
+pub async fn torrent_add(app: AppHandle, source: String, files: Vec<usize>, needed_bytes: u64, save_in: String, subfolder: Option<String>) -> R<usize> {
+    blocking(move || torrent::ensure(&app)?.add(&app, &source, files, needed_bytes, torrent::Dest { save_in, subfolder, ..Default::default() })).await
+}
+
+#[tauri::command]
+pub async fn torrent_list(app: AppHandle) -> R<Vec<torrent::TorrentRow>> {
+    blocking(move || Ok(torrent::current(&app).map(|e| e.list()).unwrap_or_default())).await
+}
+
+#[tauri::command]
+pub async fn torrent_pause(app: AppHandle, id: usize) -> R<()> {
+    blocking(move || torrent::ensure(&app)?.pause(id)).await
+}
+
+#[tauri::command]
+pub async fn torrent_resume(app: AppHandle, id: usize) -> R<()> {
+    blocking(move || torrent::ensure(&app)?.resume(id)).await
+}
+
+#[tauri::command]
+pub async fn torrent_remove(app: AppHandle, id: usize, delete_files: bool) -> R<()> {
+    blocking(move || torrent::ensure(&app)?.remove(id, delete_files)).await
+}
+
+/// Stream a file from a running torrent in the configured player.
+#[tauri::command]
+pub async fn torrent_play(app: AppHandle, id: usize, file: usize) -> R<bool> {
+    blocking(move || {
+        let url = torrent::ensure(&app)?.stream_url(id, file)?;
+        player::play_url(&app, &url)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn torrent_detail(app: AppHandle, id: usize) -> R<torrent::TorrentDetail> {
+    blocking(move || torrent::ensure(&app)?.detail(id)).await
+}
+
+#[tauri::command]
+pub async fn torrent_session_status(app: AppHandle) -> R<Option<torrent::SessionStatus>> {
+    blocking(move || Ok(torrent::current(&app).map(|e| e.session_status()))).await
+}
+
+/// One-step stream: resolve, pick the largest video, buffer, play. Blocks
+/// while buffering (up to 90 s), so the UI shows a spinner meanwhile.
+#[tauri::command]
+pub async fn torrent_stream(app: AppHandle, source: String) -> R<torrent::StreamStarted> {
+    blocking(move || torrent::ensure(&app)?.stream(&app, &source)).await
+}
+
+/// Stream a torrent already in the list (buffers first, resumes position).
+#[tauri::command]
+pub async fn torrent_stream_existing(app: AppHandle, id: usize) -> R<torrent::StreamStarted> {
+    blocking(move || torrent::ensure(&app)?.stream_existing(&app, id)).await
+}
+
+#[tauri::command]
+pub async fn torrent_keep(app: AppHandle, id: usize) -> R<()> {
+    blocking(move || torrent::ensure(&app)?.keep(&app, id)).await
+}
+
+#[tauri::command]
+pub async fn torrent_discard(app: AppHandle, id: usize) -> R<()> {
+    blocking(move || torrent::ensure(&app)?.discard(id)).await
+}
+
+/// Register or release the `magnet:` link association for Vortex.
+#[tauri::command]
+pub fn set_magnet_handler(app: AppHandle, state: State<AppState>, on: bool) -> R<()> {
+    {
+        let conn = state.db.lock().map_err(err)?;
+        db::set_setting(&conn, "magnet_handler", if on { "1" } else { "0" }).map_err(err)?;
+    }
+    crate::deeplink::set_magnet_handler(&app, on)
+}
+
+/// Magnet links that opened the app before the Downloads page was listening.
+#[tauri::command]
+pub fn pending_open_urls(app: AppHandle) -> Vec<String> {
+    crate::deeplink::take_pending(&app)
 }

@@ -111,7 +111,7 @@ export function subtitleCount(ep: Episode): number {
 }
 
 export interface ScanDone {
-  reason: "startup" | "watch" | "drive" | "tray";
+  reason: "startup" | "watch" | "drive" | "tray" | "torrent";
   stats: ScanStats;
 }
 
@@ -367,4 +367,184 @@ export const api = {
 
   onPlaybackEnded: (cb: (e: PlaybackEnded) => void): Promise<UnlistenFn> =>
     listen<PlaybackEnded>("playback-ended", (ev) => cb(ev.payload)),
+
+  // ---- torrents ----
+  torrentStatus: () => invoke<TorrentStatus>("torrent_status"),
+  torrentRestart: () => invoke<TorrentStatus>("torrent_restart"),
+  /** Resolves the file list; for magnets this waits for metadata from peers. */
+  torrentInspect: (source: string) => invoke<TorrentPreview>("torrent_inspect", { source }),
+  torrentAdd: (source: string, files: number[], neededBytes: number, saveIn: string, subfolder: string | null) =>
+    invoke<number>("torrent_add", { source, files, neededBytes, saveIn, subfolder }),
+  torrentList: () => invoke<TorrentRow[]>("torrent_list"),
+  torrentPause: (id: number) => invoke<void>("torrent_pause", { id }),
+  torrentResume: (id: number) => invoke<void>("torrent_resume", { id }),
+  torrentRemove: (id: number, deleteFiles: boolean) => invoke<void>("torrent_remove", { id, deleteFiles }),
+  /** Streams the file in the configured player. False when opened with the default app. */
+  torrentPlay: (id: number, file: number) => invoke<boolean>("torrent_play", { id, file }),
+  onTorrentDone: (cb: (p: TorrentDone) => void): Promise<UnlistenFn> =>
+    listen<TorrentDone>("torrent-done", (ev) => cb(ev.payload)),
+  torrentDetail: (id: number) => invoke<TorrentDetail>("torrent_detail", { id }),
+  torrentSessionStatus: () => invoke<SessionStatus | null>("torrent_session_status"),
+  /** One-step stream: resolve, pick the largest video, buffer, play. Resolves once the player opens. */
+  torrentStream: (source: string) => invoke<StreamStarted>("torrent_stream", { source }),
+  torrentStreamExisting: (id: number) => invoke<StreamStarted>("torrent_stream_existing", { id }),
+  torrentKeep: (id: number) => invoke<void>("torrent_keep", { id }),
+  torrentDiscard: (id: number) => invoke<void>("torrent_discard", { id }),
+  onStreamEnded: (cb: (p: StreamEnded) => void): Promise<UnlistenFn> =>
+    listen<StreamEnded>("stream-ended", (ev) => cb(ev.payload)),
+  /** Register or release the magnet: link association for Vortex. */
+  setMagnetHandler: (on: boolean) => invoke<void>("set_magnet_handler", { on }),
+  /** Magnet links that opened the app before the Downloads page was listening. */
+  pendingOpenUrls: () => invoke<string[]>("pending_open_urls"),
+  /** A magnet: or vortex:// link was clicked outside the app. */
+  onOpenUrl: (cb: (magnet: string) => void): Promise<UnlistenFn> =>
+    listen<string>("open-url", (ev) => cb(ev.payload)),
 };
+
+// ---- torrents ----
+
+export interface TorrentConfig {
+  /** socks5://host:port, empty when none */
+  proxy: string;
+  /** Library folder finished downloads move into */
+  dir: string;
+  down_kbps: number;
+  up_kbps: number;
+}
+
+export interface TorrentStatus {
+  running: boolean;
+  /** True when every connection goes through the proxy */
+  protected: boolean;
+  config: TorrentConfig;
+  error: string | null;
+}
+
+export interface PreviewFile {
+  index: number;
+  path: string;
+  size: number;
+  video: boolean;
+}
+
+export interface TorrentPreview {
+  name: string;
+  info_hash: string;
+  total_bytes: number;
+  files: PreviewFile[];
+}
+
+export interface TorrentFile {
+  index: number;
+  path: string;
+  size: number;
+  done: number;
+  included: boolean;
+  video: boolean;
+}
+
+export interface TorrentRow {
+  id: number;
+  name: string;
+  info_hash: string;
+  state: "checking" | "downloading" | "seeding" | "paused" | "error";
+  error: string | null;
+  done_bytes: number;
+  total_bytes: number;
+  uploaded_bytes: number;
+  /** Megabytes per second */
+  down_mbps: number;
+  up_mbps: number;
+  peers: number;
+  eta: string | null;
+  finished: boolean;
+  /** Started with Stream and not yet kept or discarded */
+  ephemeral: boolean;
+  files: TorrentFile[];
+}
+
+export interface TorrentDone {
+  name: string;
+  /** Names of the entries moved into the library folder */
+  moved: string[];
+}
+
+export interface PeerRow {
+  addr: string;
+  client: string | null;
+  state: string;
+  kind: string | null;
+  downloaded: number;
+  uploaded: number;
+}
+
+export interface TrackerRow {
+  url: string;
+  protocol: "http" | "https" | "udp" | "other";
+  /** False when the engine will not contact it (UDP behind a proxy) */
+  active: boolean;
+}
+
+export interface TorrentDetail {
+  id: number;
+  elapsed_secs: number;
+  downloaded: number;
+  remaining: number;
+  wasted: number;
+  uploaded: number;
+  down_mbps: number;
+  up_mbps: number;
+  down_limit_kbps: number;
+  up_limit_kbps: number;
+  share_ratio: number;
+  status: string;
+  error: string | null;
+  /** Peer counts by state, e.g. { live, seen, connecting, queued, dead } */
+  peer_counts: Record<string, number>;
+  save_as: string;
+  total_size: number;
+  piece_count: number;
+  piece_length: number;
+  /** Unix seconds */
+  created_on: number | null;
+  created_by: string | null;
+  comment: string | null;
+  info_hash: string;
+  peers: PeerRow[];
+  trackers: TrackerRow[];
+}
+
+export interface SessionStatus {
+  dht: string | null;
+  down_mbps: number;
+  up_mbps: number;
+  downloaded_total: number;
+  uploaded_total: number;
+  peers_live: number;
+  uptime_secs: number;
+  protected: boolean;
+}
+
+export interface StreamStarted {
+  id: number;
+  name: string;
+  file: number;
+  /** Resumed from this many seconds in */
+  start_secs: number;
+  /** False when no player is configured and the URL went to the default app */
+  tracked: boolean;
+  /** The torrent had already finished and moved: this played the library file */
+  from_library: boolean;
+}
+
+export interface StreamEnded {
+  id: number;
+  name: string;
+  position_secs: number;
+  duration_secs: number | null;
+  finished: boolean;
+  /** Ask Keep / Discard only for streams */
+  ephemeral: boolean;
+  /** True when the position came from the player rather than a clock */
+  exact: boolean;
+}

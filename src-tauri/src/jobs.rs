@@ -45,7 +45,7 @@ pub fn refresh(app: &AppHandle, reason: &str) {
             Ok(stats) => {
                 let _ = app.emit("scan-done", ScanDone { reason: reason.to_string(), stats: stats.clone() });
                 // Windows toast for arrivals noticed by the folder watcher or a reconnected drive.
-                if (reason == "watch" || reason == "drive") && !stats.added_titles.is_empty()
+                if (reason == "watch" || reason == "drive" || reason == "torrent") && !stats.added_titles.is_empty()
                     && setting_on(app, "notify_new", true)
                 {
                     use tauri_plugin_notification::NotificationExt;

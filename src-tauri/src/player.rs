@@ -478,3 +478,81 @@ fn db_flag(app: &AppHandle, key: &str, default: bool) -> bool {
         Err(_) => default,
     }
 }
+
+/// Open a stream URL in the configured player. Streams are not position
+/// tracked; the file is tracked as usual once it lands in the library.
+pub fn play_url(app: &AppHandle, url: &str) -> Result<bool, String> {
+    play_url_tracked(app, url, 0, None)
+}
+
+/// What the stream tracker learned by the time the player closed.
+pub struct StreamEnd {
+    pub position_secs: i64,
+    pub duration_secs: Option<i64>,
+    /// True when a real position came from the player rather than a clock.
+    pub exact: bool,
+}
+
+/// Open a stream URL in the configured player, starting at `start_secs`.
+/// With `on_end`, a thread follows the player exactly like library
+/// playback does and calls back once it closes. Returns `false` when no
+/// player is configured and the URL went to the default app (untracked).
+pub fn play_url_tracked(
+    app: &AppHandle,
+    url: &str,
+    start_secs: i64,
+    on_end: Option<Box<dyn FnOnce(StreamEnd) + Send + 'static>>,
+) -> Result<bool, String> {
+    let state = app.state::<AppState>();
+    let (kind, path) = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        (
+            db::get_setting(&conn, "player_kind").map_err(|e| e.to_string())?,
+            db::get_setting(&conn, "player_path").map_err(|e| e.to_string())?,
+        )
+    };
+    let (kind, path) = match (kind.as_deref(), path.as_deref()) {
+        (Some(kind), Some(path)) if !path.is_empty() && Path::new(path).exists() => (kind.to_string(), path.to_string()),
+        _ => {
+            tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| e.to_string())?;
+            return Ok(false);
+        }
+    };
+    let (args, link) = build_launch(&kind, url, start_secs, None);
+    let mut child = Command::new(&path).args(args).spawn().map_err(|e| format!("failed to start player: {e}"))?;
+    let Some(on_end) = on_end else { return Ok(true) };
+
+    let exe_name = Path::new(&path).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let started = Instant::now();
+    std::thread::spawn(move || {
+        let mut sys = sysinfo::System::new();
+        let mut exact_pos: Option<i64> = None;
+        let mut duration: Option<i64> = None;
+        let mut child_gone = false;
+        loop {
+            std::thread::sleep(Duration::from_secs(2));
+            if !child_gone {
+                if let Ok(Some(_)) = child.try_wait() {
+                    child_gone = true;
+                }
+            }
+            let alive = if child_gone { player_running(&mut sys, &exe_name) } else { true };
+            if !alive {
+                break;
+            }
+            if let Reading::Playing { pos, len } = read_link(&link) {
+                exact_pos = Some(pos);
+                if len.is_some() {
+                    duration = len;
+                }
+            }
+        }
+        let elapsed = started.elapsed().as_secs() as i64;
+        on_end(StreamEnd {
+            position_secs: exact_pos.unwrap_or(start_secs + elapsed),
+            duration_secs: duration,
+            exact: exact_pos.is_some(),
+        });
+    });
+    Ok(true)
+}
