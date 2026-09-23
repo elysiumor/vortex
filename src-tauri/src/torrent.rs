@@ -609,7 +609,43 @@ impl Engine {
     }
 
     pub fn remove(&self, id: usize, delete_files: bool) -> Result<(), String> {
-        self.rt().block_on(self.session.delete(TorrentIdOrHash::Id(id), delete_files)).map_err(anyhow_str)
+        let t = self.session.get(TorrentIdOrHash::Id(id)).ok_or("torrent not found")?;
+        let hash = t.info_hash().as_string();
+        let from = t.output_folder().to_path_buf();
+        // Captured before the torrent goes. librqbit deletes through its own
+        // storage handle, which a torrent that never finished initialising may
+        // not have, so check afterwards rather than assume it worked.
+        let tops = top_level_entries(&t, false);
+        tracing::info!(id, delete_files, path = %from.display(), "removing torrent");
+        self.rt().block_on(self.session.delete(TorrentIdOrHash::Id(id), delete_files)).map_err(anyhow_str)?;
+        self.remember_dest(&hash, None);
+        if !delete_files {
+            tracing::info!(id, "removed, files kept");
+            return Ok(());
+        }
+
+        let mut failed: Vec<String> = Vec::new();
+        for top in &tops {
+            let p = from.join(top);
+            let outcome = if p.is_dir() {
+                std::fs::remove_dir_all(&p)
+            } else if p.is_file() {
+                std::fs::remove_file(&p)
+            } else {
+                Ok(()) // librqbit already took it
+            };
+            if let Err(e) = outcome {
+                failed.push(format!("{}: {e}", p.display()));
+            }
+        }
+        tidy_staging(&from);
+        if failed.is_empty() {
+            tracing::info!(id, entries = tops.len(), "removed and files deleted");
+            Ok(())
+        } else {
+            tracing::warn!(id, "files left behind: {}", failed.join("; "));
+            Err(format!("Removed, but some files could not be deleted: {}", failed.join("; ")))
+        }
     }
 
     pub fn detail(&self, id: usize) -> Result<TorrentDetail, String> {
@@ -950,24 +986,7 @@ impl Engine {
             if engine.dest_for(&t.info_hash().as_string()).map(|d| d.ephemeral).unwrap_or(false) {
                 return;
             }
-            let only = t.only_files();
-            let tops: Vec<PathBuf> = t
-                .with_metadata(|m| {
-                    let mut v: Vec<PathBuf> = Vec::new();
-                    for (i, f) in m.file_infos.iter().enumerate() {
-                        if only.as_ref().map(|o| !o.contains(&i)).unwrap_or(false) {
-                            continue;
-                        }
-                        if let Some(first) = f.relative_filename.components().next() {
-                            let p = PathBuf::from(first.as_os_str());
-                            if !v.contains(&p) {
-                                v.push(p);
-                            }
-                        }
-                    }
-                    v
-                })
-                .unwrap_or_default();
+            let tops = top_level_entries(&t, true);
             let from = t.output_folder().to_path_buf();
             let hash = t.info_hash().as_string();
             // Torrents added before per-torrent destinations existed go to the library folder.
@@ -1079,6 +1098,30 @@ fn move_entries(from: &Path, tops: &[PathBuf], dest_dir: &Path) -> Vec<String> {
         }
     }
     moved
+}
+
+/// The top-level names a torrent writes under its output folder: one file, or
+/// the folder it wraps its files in. `selected_only` limits it to the files
+/// actually being downloaded, which is what matters when moving a finished
+/// torrent; deletion wants everything that might be on disk.
+fn top_level_entries(t: &Arc<ManagedTorrent>, selected_only: bool) -> Vec<PathBuf> {
+    let only = if selected_only { t.only_files() } else { None };
+    t.with_metadata(|m| {
+        let mut v: Vec<PathBuf> = Vec::new();
+        for (i, f) in m.file_infos.iter().enumerate() {
+            if only.as_ref().map(|o| !o.contains(&i)).unwrap_or(false) {
+                continue;
+            }
+            if let Some(first) = f.relative_filename.components().next() {
+                let p = PathBuf::from(first.as_os_str());
+                if !v.contains(&p) {
+                    v.push(p);
+                }
+            }
+        }
+        v
+    })
+    .unwrap_or_default()
 }
 
 /// Torrent names can carry characters Windows will not accept in a folder.

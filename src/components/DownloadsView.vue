@@ -120,15 +120,23 @@ async function streamRow(r: TorrentRow) {
   } catch (e) { toast.error(String(e)); }
   finally { streaming.value = null; }
 }
-async function keep(id: number) {
+// Same closing race as the remove dialog: hold the id outside the ref.
+let streamTarget: number | null = null;
+async function keep(id: number | null) {
+  const target = id ?? streamTarget;
+  streamTarget = null;
   streamEnded.value = null;
-  try { await api.torrentKeep(id); toast.success("Kept. It moves into your library when the download finishes."); await refreshList(); }
+  if (target === null) return;
+  try { await api.torrentKeep(target); toast.success("Kept. It moves into your library when the download finishes."); await refreshList(); }
   catch (e) { toast.error(String(e)); }
 }
-async function discard(id: number) {
+async function discard(id: number | null) {
+  const target = id ?? streamTarget;
+  streamTarget = null;
   streamEnded.value = null;
-  try { await api.torrentDiscard(id); rows.value = rows.value.filter((x) => x.id !== id); toast("Stream discarded and its files deleted."); }
-  catch (e) { toast.error(String(e)); }
+  if (target === null) return;
+  try { await api.torrentDiscard(target); rows.value = rows.value.filter((x) => x.id !== target); toast.success("Stream discarded and its files deleted."); }
+  catch (e) { toast.error(String(e)); await refreshList(); }
 }
 async function openTorrentFile() {
   const p = await open({ multiple: false, filters: [{ name: "Torrent", extensions: ["torrent"] }], title: "Open a .torrent file" });
@@ -171,10 +179,29 @@ async function reallyStart() {
 
 async function pause(r: TorrentRow) { try { await api.torrentPause(r.id); await refreshList(); } catch (e) { toast.error(String(e)); } }
 async function resume(r: TorrentRow) { try { await api.torrentResume(r.id); await refreshList(); } catch (e) { toast.error(String(e)); } }
+/**
+ * The dialog clears its `ref` as it closes, and that can happen before the
+ * button's own handler runs — which silently cancelled the action. The target
+ * is held in a plain variable that closing cannot touch.
+ */
+let removeTarget: TorrentRow | null = null;
+function askRemove(r: TorrentRow) {
+  removeTarget = r;
+  removePending.value = r;
+}
 async function remove(deleteFiles: boolean) {
-  const r = removePending.value; removePending.value = null; if (!r) return;
-  try { await api.torrentRemove(r.id, deleteFiles); rows.value = rows.value.filter((x) => x.id !== r.id); }
-  catch (e) { toast.error(String(e)); }
+  const r = removeTarget;
+  removeTarget = null;
+  removePending.value = null;
+  if (!r) return;
+  try {
+    await api.torrentRemove(r.id, deleteFiles);
+    rows.value = rows.value.filter((x) => x.id !== r.id);
+    toast.success(deleteFiles ? `Removed ${r.name} and deleted its files` : `Removed ${r.name}, files kept`);
+  } catch (e) {
+    toast.error(String(e));
+    await refreshList();
+  }
 }
 async function play(r: TorrentRow, file: number) {
   try {
@@ -251,7 +278,7 @@ onMounted(async () => {
     }
   }, 2000);
   unlistenEnded = await api.onStreamEnded((e) => {
-    if (e.ephemeral) streamEnded.value = e;
+    if (e.ephemeral) { streamTarget = e.id; streamEnded.value = e; }
     else toast(`Stopped ${e.name} at ${hms(e.position_secs)}`);
     refreshList();
   });
@@ -327,7 +354,7 @@ defineExpose({ reload: async () => { await refreshStatus(); await refreshList();
             </template>
             <Button v-else-if="r.state === 'paused'" size="icon-sm" variant="ghost" title="Resume" @click="resume(r)"><Play class="fill-current" /></Button>
             <Button v-else-if="!r.finished" size="icon-sm" variant="ghost" title="Pause" @click="pause(r)"><Pause class="fill-current" /></Button>
-            <Button size="icon-sm" variant="ghost" class="text-muted-foreground hover:text-destructive" title="Remove" @click="removePending = r"><Trash2 /></Button>
+            <Button size="icon-sm" variant="ghost" class="text-muted-foreground hover:text-destructive" title="Remove" @click="askRemove(r)"><Trash2 /></Button>
           </div>
         </div>
 
@@ -506,8 +533,8 @@ defineExpose({ reload: async () => { await refreshStatus(); await refreshList();
         </AlertDialogHeader>
         <AlertDialogFooter>
           <AlertDialogCancel>Decide later</AlertDialogCancel>
-          <Button variant="outline" @click="streamEnded && discard(streamEnded.id)"><Trash2 /> Discard</Button>
-          <AlertDialogAction @click="streamEnded && keep(streamEnded.id)"><Save /> Keep in library</AlertDialogAction>
+          <Button variant="outline" @click="discard(streamEnded?.id ?? null)"><Trash2 /> Discard</Button>
+          <AlertDialogAction @click="keep(streamEnded?.id ?? null)"><Save /> Keep in library</AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
