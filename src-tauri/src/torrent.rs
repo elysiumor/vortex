@@ -7,9 +7,10 @@
 //! through a proxy. Without a proxy the engine behaves like any ordinary
 //! client and the UI says so plainly.
 //!
-//! Files download into `<folder>/.incomplete` (ignored by the scanner) and are
-//! moved up into the library folder when the torrent finishes, so the folder
-//! watcher picks them up like any other arrival.
+//! Files download into `<folder>/.incomplete` (hidden, and ignored by the
+//! scanner) and are moved into place when the torrent finishes, so the folder
+//! watcher picks them up like any other arrival. The staging folder is removed
+//! once the last torrent has left it.
 
 use crate::{db, jobs, parser, AppState};
 use librqbit::api::TorrentIdOrHash;
@@ -231,6 +232,34 @@ fn anyhow_str(e: anyhow::Error) -> String {
     format!("{e:#}")
 }
 
+/// Create the staging folder, out of the user's way. Hiding it keeps Explorer
+/// tidy and, on Windows, is also what makes the scanner skip it.
+fn make_staging(dir: &Path) -> Result<PathBuf, String> {
+    let staging = dir.join(STAGING_DIR);
+    std::fs::create_dir_all(&staging).map_err(|e| format!("cannot create {}: {e}", staging.display()))?;
+    hide(&staging);
+    Ok(staging)
+}
+
+#[cfg(windows)]
+fn hide(p: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN};
+    let wide: Vec<u16> = p.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    unsafe { SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_HIDDEN) };
+}
+
+#[cfg(not(windows))]
+fn hide(_p: &Path) {}
+
+/// Drop the staging folder once the last torrent has left it. Fails harmlessly
+/// while others are still downloading, and `make_staging` recreates it.
+fn tidy_staging(staging: &Path) {
+    if staging.file_name().map(|n| n == STAGING_DIR).unwrap_or(false) {
+        let _ = std::fs::remove_dir(staging);
+    }
+}
+
 pub fn read_config(app: &AppHandle) -> Config {
     let state = app.state::<AppState>();
     let Ok(conn) = state.db.lock() else { return Config::default() };
@@ -283,8 +312,7 @@ impl Engine {
         if !dir.is_dir() {
             return Err(format!("Download folder is not available: {}", dir.display()));
         }
-        let staging = dir.join(STAGING_DIR);
-        std::fs::create_dir_all(&staging).map_err(|e| format!("cannot create {}: {e}", staging.display()))?;
+        let staging = make_staging(&dir)?;
         let persist = persist_dir(app).ok_or("no app data dir")?;
         std::fs::create_dir_all(&persist).map_err(|e| e.to_string())?;
 
@@ -461,8 +489,7 @@ impl Engine {
         let dest = Dest { save_in: save_in.to_string_lossy().to_string(), subfolder, ..dest };
         // Pieces are written under `<save in>\.incomplete` so the scanner
         // never sees a half-finished file, whichever drive the user picked.
-        let staging = save_in.join(STAGING_DIR);
-        std::fs::create_dir_all(&staging).map_err(|e| format!("cannot create {}: {e}", staging.display()))?;
+        let staging = make_staging(&save_in)?;
 
         let add = self.to_add(source)?;
         let opts = AddTorrentOptions {
@@ -911,6 +938,7 @@ impl Engine {
             // Forget (keep files) so nothing holds the files open while they move.
             let _ = engine.session.delete(TorrentIdOrHash::Id(id), false).await;
             let (moved, root) = move_finished(&from, &tops, &dest);
+            tidy_staging(&from);
             // Remember where it went, so streaming the same link later plays
             // the finished file instead of fetching it again.
             engine.remember_dest(
@@ -1125,6 +1153,27 @@ mod tests {
         assert_eq!(normalize_source(&format!("  {hex} ")), format!("magnet:?xt=urn:btih:{hex}"));
         assert_eq!(normalize_source("magnet:?xt=urn:btih:abc"), "magnet:?xt=urn:btih:abc");
         assert_eq!(normalize_source("F:\\Torrents\\x.torrent"), "F:\\Torrents\\x.torrent");
+    }
+
+    #[test]
+    fn staging_is_removed_only_when_empty() {
+        let root = std::env::temp_dir().join(format!("vortex-st-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let staging = make_staging(&root).unwrap();
+        assert!(staging.is_dir());
+
+        std::fs::write(staging.join("part.mkv"), b"x").unwrap();
+        tidy_staging(&staging);
+        assert!(staging.is_dir(), "a torrent is still using it");
+
+        std::fs::remove_file(staging.join("part.mkv")).unwrap();
+        tidy_staging(&staging);
+        assert!(!staging.exists(), "empty staging should be gone");
+
+        // Never touches anything that is not the staging folder.
+        tidy_staging(&root);
+        assert!(root.is_dir());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
