@@ -19,11 +19,17 @@ use tauri::{Manager, WindowEvent};
 
 pub struct AppState {
     pub db: Mutex<Connection>,
+    /// Long jobs open their own connection from here rather than holding
+    /// `db` for minutes; SQLite is in WAL mode, so that is safe.
+    pub db_path: std::path::PathBuf,
     pub fetching: AtomicBool,
     pub probing: AtomicBool,
     pub scanning: AtomicBool,
     pub rescan_wanted: AtomicBool,
     pub torrent: Mutex<Option<std::sync::Arc<torrent::Engine>>>,
+    /// Held only while an engine is being created, so readers of `torrent`
+    /// are never blocked behind a network-bound startup.
+    pub torrent_start: Mutex<()>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -41,7 +47,8 @@ pub fn run() {
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
-            let conn = db::open(&dir.join("vortex.db"))?;
+            let db_path = dir.join("vortex.db");
+            let conn = db::open(&db_path)?;
             // Keys saved before the connected flag existed were verified with "Test & save".
             let has_key = db::get_setting(&conn, "tmdb_key")?.map(|k| !k.is_empty()).unwrap_or(false);
             if has_key && db::get_setting(&conn, "tmdb_connected")?.is_none() {
@@ -59,11 +66,13 @@ pub fn run() {
             }
             app.manage(AppState {
                 db: Mutex::new(conn),
+                db_path,
                 fetching: AtomicBool::new(false),
                 probing: AtomicBool::new(false),
                 scanning: AtomicBool::new(false),
                 rescan_wanted: AtomicBool::new(false),
                 torrent: Mutex::new(None),
+                torrent_start: Mutex::new(()),
             });
 
             let handle = app.handle().clone();

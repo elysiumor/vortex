@@ -146,6 +146,9 @@ pub struct StreamEnded {
     pub exact: bool,
 }
 
+/// How long to wait for a magnet's file list before giving up.
+const METADATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Head buffer before the player is launched: whichever comes first.
 const STREAM_HEAD_BYTES: u64 = 8 * 1024 * 1024;
 const STREAM_HEAD_FRACTION: f64 = 0.02;
@@ -416,7 +419,19 @@ impl Engine {
     pub fn inspect(&self, source: &str) -> Result<Preview, String> {
         let add = self.to_add(source)?;
         let opts = AddTorrentOptions { list_only: true, ..Default::default() };
-        let resp = self.rt.block_on(self.session.add_torrent(add, Some(opts))).map_err(anyhow_str)?;
+        // A magnet with no reachable peers never resolves, so bound the wait
+        // rather than leave the caller spinning forever.
+        let resp = self
+            .rt
+            .block_on(async { tokio::time::timeout(METADATA_TIMEOUT, self.session.add_torrent(add, Some(opts))).await })
+            .map_err(|_| {
+                if self.protected() {
+                    "No metadata after 60 seconds. Check the proxy, and note that torrents with only UDP trackers cannot find peers in proxy mode.".to_string()
+                } else {
+                    "No metadata after 60 seconds. The torrent may have no seeds.".to_string()
+                }
+            })?
+            .map_err(anyhow_str)?;
         match resp {
             AddTorrentResponse::ListOnly(l) => {
                 let files: Vec<PreviewFile> = l
@@ -1101,13 +1116,19 @@ pub fn current(app: &AppHandle) -> Option<Arc<Engine>> {
 }
 
 pub fn ensure(app: &AppHandle) -> Result<Arc<Engine>, String> {
+    if let Some(e) = current(app) {
+        return Ok(e);
+    }
     let state = app.state::<AppState>();
-    let mut guard = state.torrent.lock().map_err(|e| e.to_string())?;
-    if let Some(e) = guard.as_ref() {
-        return Ok(e.clone());
+    // Starting an engine bootstraps DHT and reads the persisted session, which
+    // takes network time. Waiting here rather than on `torrent` keeps `current`
+    // cheap, so the Downloads page keeps polling instead of piling up.
+    let _startup = state.torrent_start.lock().map_err(|e| e.to_string())?;
+    if let Some(e) = current(app) {
+        return Ok(e); // another thread got there first
     }
     let engine = Engine::start(app, &read_config(app))?;
-    *guard = Some(engine.clone());
+    *state.torrent.lock().map_err(|e| e.to_string())? = Some(engine.clone());
     Ok(engine)
 }
 

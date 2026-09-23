@@ -35,8 +35,11 @@ pub fn refresh(app: &AppHandle, reason: &str) {
     loop {
         state.rescan_wanted.store(false, Ordering::SeqCst);
         let result = {
-            let guard = state.db.lock();
-            match guard {
+            // A scan can run for minutes over external drives. Holding the
+            // shared connection would block every synchronous command, and
+            // those run on the main thread, so the window would freeze for
+            // the duration. WAL mode lets the scan have its own connection.
+            match db::open(&state.db_path) {
                 Ok(mut conn) => scanner::scan_all(&mut conn),
                 Err(e) => Err(e.to_string()),
             }

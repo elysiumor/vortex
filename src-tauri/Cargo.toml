@@ -1,6 +1,6 @@
 [package]
 name = "vortex"
-version = "1.1.0"
+version = "1.1.1"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -42,7 +42,7 @@ librqbit = { version = "9", default-features = false, features = ["http-api", "t
 # SHA-1 via the Windows crypto API and TLS via schannel: keeps aws-lc-sys (needs CMake + NASM) out of the build.
 librqbit-core = { version = "9", default-features = false, features = ["sha1-crypto-hash"] }
 reqwest13 = { package = "reqwest", version = "0.13", default-features = false, features = ["native-tls"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 anyhow = "1"
 librqbit-dualstack-sockets = "0.7"
 
