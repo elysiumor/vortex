@@ -175,7 +175,16 @@ onMounted(async () => {
   await load();
   unlisteners.push(await api.onDurationsDone((p) => { probing.value = false; durationResult.value = p.total === 0 ? "All files already have a duration" : `Read ${p.found} of ${p.total} files`; }));
   unlisteners.push(await api.onPosterProgress((p) => { fetching.value = true; posterProgress.value = p; }));
-  unlisteners.push(await api.onPostersDone((p) => { fetching.value = false; posterProgress.value = p; emit("scanned"); toast(p.current ? `Poster fetch stopped: ${p.current}` : `Posters: ${p.matched} of ${p.total} matched`); }));
+  // Deliberately no emit("scanned") here. That runs onScanned, which starts
+  // another poster fetch, which finishes and lands back on this handler: an
+  // endless loop of fetches and toasts. App.vue already refreshes the views on
+  // this same event.
+  unlisteners.push(await api.onPostersDone((p) => {
+    fetching.value = false;
+    posterProgress.value = p;
+    if (p.current) toast.error(`Poster fetch stopped: ${p.current}`);
+    else if (p.total > 0) toast(`Posters: ${p.matched} of ${p.total} matched`);
+  }));
 });
 onUnmounted(() => unlisteners.forEach((u) => u()));
 </script>

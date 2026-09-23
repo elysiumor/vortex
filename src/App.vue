@@ -94,7 +94,19 @@ async function removeSmartList(l: SmartList) {
   if (activeSmart.value?.id === l.id) go("home");
 }
 
+/**
+ * Scan, poster and duration events often land within milliseconds of each
+ * other, and reloading every view once per event means the same queries run
+ * several times over. Collapse a burst into a single refresh; the delay is
+ * short enough to be invisible.
+ */
+let refreshTimer: number | undefined;
 function refreshAll() {
+  clearTimeout(refreshTimer);
+  refreshTimer = window.setTimeout(reloadViews, 120);
+}
+
+function reloadViews() {
   home.value?.reload();
   library.value?.reload();
   detail.value?.reload();
@@ -203,7 +215,10 @@ onMounted(async () => {
     toast.success(p.moved.length ? `Download finished: ${p.name}` : `Download finished: ${p.name} (files stayed in .incomplete)`);
   }));
 });
-onUnmounted(() => unlisteners.forEach((u) => u()));
+onUnmounted(() => {
+  clearTimeout(refreshTimer);
+  unlisteners.forEach((u) => u());
+});
 </script>
 
 <template>

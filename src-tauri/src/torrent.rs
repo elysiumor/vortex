@@ -728,7 +728,16 @@ impl Engine {
             None => Some("Off".to_string()),
             Some(d) => {
                 let s = d.stats();
-                Some(format!("{} nodes", s.routing_table_size + s.routing_table_size_v6))
+                let nodes = s.routing_table_size + s.routing_table_size_v6;
+                // An empty routing table after startup means the bootstrap
+                // never answered, which on Windows almost always means UDP is
+                // being dropped by a firewall or the ISP. Say so, rather than
+                // showing a bare zero that looks like idleness.
+                if nodes == 0 {
+                    Some("no nodes — UDP may be blocked".to_string())
+                } else {
+                    Some(format!("{nodes} nodes"))
+                }
             }
         };
         SessionStatus {

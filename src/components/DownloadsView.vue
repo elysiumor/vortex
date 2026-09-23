@@ -234,7 +234,22 @@ onMounted(async () => {
   await refreshStatus();
   await refreshList();
   await refreshDetails();
-  timer = window.setInterval(async () => { await refreshList(); sample(); await refreshDetails(); }, 2000);
+  // One tick at a time. Pausing or resuming a torrent holds librqbit's state
+  // lock, and torrent_list needs it, so a tick can outlast the interval. Left
+  // unguarded the calls stack up and all return at once, long after the data
+  // they carry was current.
+  let ticking = false;
+  timer = window.setInterval(async () => {
+    if (ticking) return;
+    ticking = true;
+    try {
+      await refreshList();
+      sample();
+      await refreshDetails();
+    } finally {
+      ticking = false;
+    }
+  }, 2000);
   unlistenEnded = await api.onStreamEnded((e) => {
     if (e.ephemeral) streamEnded.value = e;
     else toast(`Stopped ${e.name} at ${hms(e.position_secs)}`);

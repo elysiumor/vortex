@@ -417,13 +417,15 @@ pub fn stats(conn: &Connection) -> rusqlite::Result<Stats> {
     in_progress.truncate(10);
     s.in_progress = in_progress;
 
-    let now: i64 = conn.query_row("SELECT strftime('%s','now')", [], |r| r.get(0))?;
+    // strftime returns TEXT, so the cast is required: without it rusqlite
+    // rejects the row and the whole statistics page fails to load.
+    let now: i64 = conn.query_row("SELECT CAST(strftime('%s','now') AS INTEGER)", [], |r| r.get(0))?;
     let mut stale: Vec<(i64, String, i64)> = items
         .iter()
         .filter(|m| m.watched_count > 0 && m.watched_count < m.episode_count)
         .filter_map(|m| {
             let lw = m.last_watched.as_ref()?;
-            let t: i64 = conn.query_row("SELECT strftime('%s', ?1)", [lw], |r| r.get(0)).ok()?;
+            let t: i64 = conn.query_row("SELECT CAST(strftime('%s', ?1) AS INTEGER)", [lw], |r| r.get(0)).ok()?;
             let days = (now - t) / 86400;
             (days >= 60).then_some((m.id, m.title.clone(), days))
         })
@@ -1199,4 +1201,58 @@ pub fn all_settings(conn: &Connection) -> rusqlite::Result<Vec<(String, String)>
     let mut stmt = conn.prepare("SELECT key, value FROM settings")?;
     let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
     rows.collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db() -> (Connection, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("vortex-db-{}-{:?}.db", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_file(&path);
+        (open(&path).unwrap(), path)
+    }
+
+    /// The statistics page once failed outright because `strftime` returns
+    /// TEXT and the result was read as an integer. It was invisible until the
+    /// UI started reporting failed commands, so it gets a test.
+    #[test]
+    fn stats_runs_with_and_without_watch_history() {
+        let (conn, path) = temp_db();
+
+        // Empty library.
+        let s = stats(&conn).expect("stats on an empty library");
+        assert_eq!(s.movies, 0);
+        assert_eq!(s.series, 0);
+
+        // A partly watched series with an old last-watched date exercises both
+        // strftime calls, including the "stale" branch.
+        let lib = add_library(&conn, r"F:\Test").unwrap();
+        conn.execute(
+            "INSERT INTO media_items (id, kind, title, sort_key) VALUES (1, 'series', 'Example', 'example')",
+            [],
+        )
+        .unwrap();
+        for id in [1i64, 2] {
+            conn.execute(
+                "INSERT INTO episodes (id, media_item_id, library_id, path, file_name, episode, size, modified)
+                 VALUES (?1, 1, ?2, ?3, 'e.mkv', ?1, 1, 1)",
+                params![id, lib.id, format!(r"F:\Test\e{id}.mkv")],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO watch_progress (episode_id, position_secs, completed, last_watched)
+             VALUES (1, 100, 1, datetime('now', '-200 days'))",
+            [],
+        )
+        .unwrap();
+
+        let s = stats(&conn).expect("stats with watch history");
+        assert_eq!(s.series, 1);
+        assert!(s.stale.iter().any(|(_, title, days)| title == "Example" && *days >= 60), "a title untouched for 200 days should be stale, got {:?}", s.stale);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
 }

@@ -69,9 +69,9 @@ pub fn quit_app(app: AppHandle) {
 
 /// Show the session log in Explorer, for sending on when something breaks.
 #[tauri::command]
-pub fn reveal_log(app: AppHandle) -> R<()> {
+pub async fn reveal_log(app: AppHandle) -> R<()> {
     let dir = app.path().app_data_dir().map_err(err)?;
-    reveal_path(dir.join("vortex.log").to_string_lossy().to_string())
+    reveal_path(dir.join("vortex.log").to_string_lossy().to_string()).await
 }
 
 // ---- browsing ----
@@ -233,11 +233,16 @@ pub async fn play_episode(app: AppHandle, episode_id: i64) -> R<bool> {
 
 /// Open Windows Explorer with the file selected.
 #[tauri::command]
-pub fn reveal_path(path: String) -> R<()> {
-    if !std::path::Path::new(&path).exists() {
-        return Err("File is not available. Is the drive connected?".into());
-    }
-    tauri_plugin_opener::reveal_item_in_dir(&path).map_err(err)
+pub async fn reveal_path(path: String) -> R<()> {
+    // Launching Explorer is a process spawn, and the existence check can stall
+    // on a sleeping drive. Neither belongs on the main thread.
+    blocking(move || {
+        if !std::path::Path::new(&path).exists() {
+            return Err("File is not available. Is the drive connected?".into());
+        }
+        tauri_plugin_opener::reveal_item_in_dir(&path).map_err(err)
+    })
+    .await
 }
 
 #[tauri::command]
