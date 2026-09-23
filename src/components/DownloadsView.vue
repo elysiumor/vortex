@@ -233,10 +233,21 @@ const count = (d: TorrentDetail, k: string) => d.peer_counts?.[k] ?? 0;
 async function refreshDetails() {
   if (!status.value?.running) return;
   try { session.value = await api.torrentSessionStatus(); } catch { /* engine restarting */ }
-  for (const id of expanded.value) {
+
+  // Forget torrents that are gone. Expanding one and then removing it used to
+  // leave its id here, and the poll asked for its details every two seconds
+  // forever, failing each time.
+  const live = new Set(rows.value.map((r) => r.id));
+  const stillOpen = [...expanded.value].filter((id) => live.has(id));
+  if (stillOpen.length !== expanded.value.size) {
+    expanded.value = new Set(stillOpen);
+    detail.value = Object.fromEntries(Object.entries(detail.value).filter(([id]) => live.has(Number(id))));
+  }
+
+  for (const id of stillOpen) {
     if (tabFor(id) === "files") continue;
     try { detail.value = { ...detail.value, [id]: await api.torrentDetail(id) }; }
-    catch { /* removed */ }
+    catch { /* removed between the check and the call */ }
   }
 }
 function sample() {
