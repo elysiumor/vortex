@@ -2,7 +2,7 @@
 import { onMounted, onUnmounted, ref } from "vue";
 import { toast } from "vue-sonner";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { FolderPlus, HardDrive, RefreshCw, Trash2, Check, Download, Upload, Sun, Moon, Monitor, KeyRound, Power, FileText } from "@lucide/vue";
+import { FolderPlus, HardDrive, RefreshCw, Trash2, Check, Download, Upload, Sun, Moon, Monitor, KeyRound, Power, FileText, FolderOpen } from "@lucide/vue";
 import { api, type DetectedPlayer, type Drive, type Library, type PosterProgress, type ScanStats, type TorrentStatus } from "../lib/api";
 import { applyTheme, loadTheme, type Theme } from "../lib/theme";
 import { Button } from "@/components/ui/button";
@@ -118,6 +118,10 @@ async function setMagnetHandler(on: boolean) {
   magnetHandler.value = on;
   try { await api.setMagnetHandler(on); toast.success(on ? "Vortex now opens magnet links" : "Magnet links released"); }
   catch (e) { magnetHandler.value = !on; toast.error(String(e)); }
+}
+async function browseTorrentDir() {
+  const p = await open({ directory: true, multiple: false, defaultPath: torrentDir.value || undefined, title: "Default folder for downloads" });
+  if (p) torrentDir.value = p as string;
 }
 async function saveTorrent() {
   torrentBusy.value = true;
@@ -261,11 +265,17 @@ onUnmounted(() => unlisteners.forEach((u) => u()));
       <CardContent class="space-y-3">
         <div>
           <div class="mb-1 text-sm font-medium">Default "Save in" folder</div>
-          <Select v-model="torrentDir">
-            <SelectTrigger class="w-full"><SelectValue placeholder="Choose a library folder" /></SelectTrigger>
-            <SelectContent><SelectItem v-for="lib in libraries" :key="lib.id" :value="lib.path">{{ lib.path }}</SelectItem></SelectContent>
-          </Select>
-          <div class="mt-1 text-xs text-muted-foreground">{{ libraries.length ? "Each download can still pick any folder and whether to create a subfolder." : "Add a library folder first." }}</div>
+          <div class="flex gap-2">
+            <Input v-model="torrentDir" placeholder="F:\Movies" class="flex-1" />
+            <Button variant="outline" @click="browseTorrentDir"><FolderOpen /> Browse…</Button>
+          </div>
+          <div v-if="libraries.length" class="mt-1.5 flex flex-wrap items-center gap-1.5">
+            <span class="text-xs text-muted-foreground">Library folders:</span>
+            <Button v-for="lib in libraries" :key="lib.id" size="xs" :variant="torrentDir === lib.path ? 'default' : 'outline'" @click="torrentDir = lib.path">
+              <Check v-if="torrentDir === lib.path" /> {{ lib.name }}
+            </Button>
+          </div>
+          <div class="mt-1 text-xs text-muted-foreground">Any folder works. Downloads land here unless a particular one picks somewhere else, and each can still create its own subfolder.</div>
         </div>
         <div>
           <div class="mb-1 text-sm font-medium">SOCKS5 proxy</div>

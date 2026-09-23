@@ -38,6 +38,8 @@ const destPreview = computed(() => {
   return createSubfolder.value ? `${base}\\${subfolderName.value.trim() || preview.value?.name || ""}\\` : `${base}\\`;
 });
 const pickedBytes = computed(() => preview.value?.files.filter((f) => picked.value.has(f.index)).reduce((a, f) => a + f.size, 0) ?? 0);
+/** Resolving a link or buffering a stream blocks every entry point. */
+const busy = computed(() => inspecting.value || streaming.value !== null);
 
 function fmtBytes(b: number): string {
   if (b >= 1073741824) return `${(b / 1073741824).toFixed(2)} GB`;
@@ -107,9 +109,17 @@ async function streamSource(src: string) {
 }
 const pendingStream = ref<string | null>(null);
 async function streamMagnet() { const m = asMagnet(magnet.value); if (!m) { toast.error("Paste a magnet link or an info hash"); return; } await streamSource(m); }
-async function streamTorrentFile() {
-  const p = await open({ multiple: false, filters: [{ name: "Torrent", extensions: ["torrent"] }], title: "Stream a .torrent file" });
-  if (p) await streamSource(p as string);
+/** Import opens the file list; Stream or Download is chosen there. */
+async function importTorrentFile() {
+  const p = await open({ multiple: false, filters: [{ name: "Torrent", extensions: ["torrent"] }], title: "Import a torrent file" });
+  if (p) await inspect(p as string);
+}
+
+/** Stream from the file-picker dialog rather than starting a download. */
+async function streamFromPreview() {
+  const src = source.value;
+  preview.value = null;
+  await streamSource(src);
 }
 async function streamRow(r: TorrentRow) {
   streaming.value = r.name;
@@ -137,10 +147,6 @@ async function discard(id: number | null) {
   if (target === null) return;
   try { await api.torrentDiscard(target); rows.value = rows.value.filter((x) => x.id !== target); toast.success("Stream discarded and its files deleted."); }
   catch (e) { toast.error(String(e)); await refreshList(); }
-}
-async function openTorrentFile() {
-  const p = await open({ multiple: false, filters: [{ name: "Torrent", extensions: ["torrent"] }], title: "Open a .torrent file" });
-  if (p) await inspect(p as string);
 }
 async function browseSaveIn() {
   const p = await open({ directory: true, multiple: false, defaultPath: saveIn.value || undefined, title: "Save in" });
@@ -323,16 +329,16 @@ defineExpose({ reload: async () => { await refreshStatus(); await refreshList();
     </p>
 
     <div class="flex flex-wrap gap-2">
-      <Input v-model="magnet" placeholder="Paste a magnet link or an info hash" class="min-w-64 flex-1" :disabled="inspecting || streaming !== null" @keydown.enter="streamMagnet" />
-      <Button :disabled="inspecting || streaming !== null || !magnet.trim()" title="Play the largest video right away; keep or discard when you close the player" @click="streamMagnet"><Loader2 v-if="streaming" class="animate-spin" /><Play v-else class="fill-current" /> Stream</Button>
-      <Button variant="outline" :disabled="inspecting || streaming !== null || !magnet.trim()" @click="addMagnet"><Loader2 v-if="inspecting" class="animate-spin" /><Download v-else /> Download…</Button>
-      <Button variant="outline" :disabled="inspecting || streaming !== null" @click="streamTorrentFile"><FileUp /> Stream .torrent…</Button>
-      <Button variant="ghost" :disabled="inspecting || streaming !== null" @click="openTorrentFile"><FileUp /> Download .torrent…</Button>
+      <Input v-model="magnet" placeholder="Paste a magnet link or an info hash" class="min-w-72 flex-1" :disabled="busy" @keydown.enter="streamMagnet" />
+      <Button :disabled="busy || !magnet.trim()" title="Play the largest video right away; keep or discard when you close the player" @click="streamMagnet"><Loader2 v-if="streaming" class="animate-spin" /><Play v-else class="fill-current" /> Stream</Button>
+      <Button variant="outline" :disabled="busy || !magnet.trim()" title="Choose which files to fetch and where they go" @click="addMagnet"><Loader2 v-if="inspecting" class="animate-spin" /><Download v-else /> Download…</Button>
+      <div class="mx-1 h-6 w-px bg-border" aria-hidden="true"></div>
+      <Button variant="secondary" :disabled="busy" title="Open a .torrent file from your computer" @click="importTorrentFile"><FileUp /> Import Torrent File</Button>
     </div>
     <p v-if="inspecting" class="text-xs text-muted-foreground">Fetching the file list from peers… magnets can take a little while.</p>
     <p v-if="streaming" class="flex items-center gap-2 text-xs text-muted-foreground"><Loader2 class="size-3.5 animate-spin" /> Finding peers and buffering the first few megabytes… the player opens by itself.</p>
 
-    <EmptyState v-if="status?.running && rows.length === 0" title="Nothing downloading" hint="Paste a magnet link or open a .torrent file. Finished downloads move into your library folder and show up like any other file.">
+    <EmptyState v-if="status?.running && rows.length === 0" title="Nothing downloading" hint="Paste a magnet link, or import a .torrent file from your computer. Finished downloads move into your library folder and show up like any other file.">
       <template #icon><Download class="size-6" /></template>
     </EmptyState>
 
@@ -513,6 +519,7 @@ defineExpose({ reload: async () => { await refreshStatus(); await refreshList();
         </div>
         <DialogFooter>
           <Button variant="ghost" @click="preview = null">Cancel</Button>
+          <Button variant="outline" :disabled="starting || busy" title="Play the largest video now; keep or discard when you close the player" @click="streamFromPreview"><Play class="fill-current" /> Stream instead</Button>
           <Button :disabled="starting || picked.size === 0 || !saveIn.trim()" @click="startDownload"><Loader2 v-if="starting" class="animate-spin" /><Download v-else /> Start download</Button>
         </DialogFooter>
       </DialogContent>

@@ -590,9 +590,18 @@ pub fn add_history(
 
 pub fn list_history(conn: &Connection, limit: i64) -> rusqlite::Result<Vec<HistoryEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT h.id, h.at, h.position_secs, h.completed, h.exact, h.source, h.episode_id, m.title, m.kind, m.id
-         FROM history h JOIN episodes e ON e.id = h.episode_id JOIN media_items m ON m.id = e.media_item_id
-         ORDER BY h.at DESC, h.id DESC LIMIT ?1",
+        // One row per file, showing where you stopped most recently. Every
+        // session is still recorded — the statistics read the full table — but
+        // a list repeating the same film at four different timestamps is a log,
+        // not something you can act on.
+        "SELECT id, at, position_secs, completed, exact, source, episode_id, item_title, kind, media_item_id FROM (
+             SELECT h.id AS id, h.at AS at, h.position_secs AS position_secs, h.completed AS completed,
+                    h.exact AS exact, h.source AS source, h.episode_id AS episode_id,
+                    m.title AS item_title, m.kind AS kind, m.id AS media_item_id,
+                    ROW_NUMBER() OVER (PARTITION BY h.episode_id ORDER BY h.at DESC, h.id DESC) AS rn
+             FROM history h JOIN episodes e ON e.id = h.episode_id JOIN media_items m ON m.id = e.media_item_id
+         ) WHERE rn = 1
+         ORDER BY at DESC, id DESC LIMIT ?1",
     )?;
     let rows: Vec<(i64, String, i64, i64, i64, String, i64, String, String, i64)> = stmt
         .query_map([limit], |r| {
@@ -1211,6 +1220,41 @@ mod tests {
         let path = std::env::temp_dir().join(format!("vortex-db-{}-{:?}.db", std::process::id(), std::thread::current().id()));
         let _ = std::fs::remove_file(&path);
         (open(&path).unwrap(), path)
+    }
+
+    /// The list shows where you left each file, so repeated sessions of the
+    /// same episode collapse to the most recent one. The full table is kept:
+    /// the statistics still count every session.
+    #[test]
+    fn history_lists_each_file_once_at_its_latest_position() {
+        let (conn, path) = temp_db();
+        let lib = add_library(&conn, r"F:\Test").unwrap();
+        conn.execute("INSERT INTO media_items (id, kind, title, sort_key) VALUES (1, 'movie', 'Example', 'example')", []).unwrap();
+        conn.execute(
+            "INSERT INTO episodes (id, media_item_id, library_id, path, file_name, size, modified)
+             VALUES (1, 1, ?1, ?2, 'movie.mkv', 1, 1)",
+            params![lib.id, r"F:\Test\movie.mkv"],
+        )
+        .unwrap();
+        // Three sessions of one film, watched further along each time.
+        for (mins, pos) in [(30, 600i64), (20, 3775), (10, 4732)] {
+            conn.execute(
+                "INSERT INTO history (episode_id, at, position_secs) VALUES (1, datetime('now', ?1), ?2)",
+                params![format!("-{mins} minutes"), pos],
+            )
+            .unwrap();
+        }
+
+        let list = list_history(&conn, 100).unwrap();
+        assert_eq!(list.len(), 1, "one row per file, got {:?}", list.iter().map(|h| h.position_secs).collect::<Vec<_>>());
+        assert_eq!(list[0].position_secs, 4732, "should be the most recent stop");
+
+        // Every session is still on record for the statistics.
+        let sessions: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |r| r.get(0)).unwrap();
+        assert_eq!(sessions, 3);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The statistics page once failed outright because `strftime` returns
