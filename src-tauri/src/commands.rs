@@ -38,12 +38,16 @@ pub fn remove_library(state: State<AppState>, id: i64) -> R<()> {
 }
 
 #[tauri::command]
-pub async fn scan_libraries(app: AppHandle, state: State<'_, AppState>) -> R<ScanStats> {
-    let stats = {
-        let mut conn = state.db.lock().map_err(err)?;
-        scanner::scan_all(&mut conn)?
-    };
-    crate::tray::rebuild(&app);
+pub async fn scan_libraries(app: AppHandle) -> R<ScanStats> {
+    // Own connection, not the shared one: holding that across a scan blocks
+    // every synchronous command, and those run on the main thread.
+    let stats = blocking(move || {
+        let mut conn = db::open(&app.state::<AppState>().db_path).map_err(err)?;
+        let stats = scanner::scan_all(&mut conn)?;
+        crate::tray::rebuild(&app);
+        Ok(stats)
+    })
+    .await?;
     Ok(stats)
 }
 
@@ -571,4 +575,16 @@ pub fn set_magnet_handler(app: AppHandle, state: State<AppState>, on: bool) -> R
 #[tauri::command]
 pub fn pending_open_urls(app: AppHandle) -> Vec<String> {
     crate::deeplink::take_pending(&app)
+}
+
+/// Bridge from the WebView into the Rust log. The backend cannot see the
+/// renderer, and that is exactly where slow commands, uncaught errors and
+/// dropped frames show up, so the UI reports them here.
+#[tauri::command]
+pub fn log_frontend(level: String, message: String) {
+    match level.as_str() {
+        "error" => tracing::error!(target: "ui", "{message}"),
+        "warn" => tracing::warn!(target: "ui", "{message}"),
+        _ => tracing::info!(target: "ui", "{message}"),
+    }
 }

@@ -14,7 +14,7 @@ use tracing_subscriber::EnvFilter;
 
 /// Default verbosity. librqbit is chatty at debug, so it is held at info
 /// unless `VORTEX_LOG` overrides everything.
-const DEFAULT_FILTER: &str = "info,vortex_lib=debug,librqbit=info,librqbit_dht=warn";
+const DEFAULT_FILTER: &str = "info,ui=debug,vortex_lib=debug,librqbit=info,librqbit_dht=warn";
 
 /// Start file logging and return the path, so the UI can offer to open it.
 pub fn init(dir: &Path) -> Option<PathBuf> {

@@ -364,6 +364,7 @@ impl Engine {
         let dests_file = persist.join("dests.json");
         let dests = std::fs::read(&dests_file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         let api = Api::new(session.clone(), None, None);
+        tracing::info!(proxy = proxy.is_some(), dir = %dir.display(), stream_port, "torrent engine started");
         let engine = Arc::new(Engine {
             rt: Some(rt),
             session,

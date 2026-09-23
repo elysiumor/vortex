@@ -34,6 +34,8 @@ pub fn refresh(app: &AppHandle, reason: &str) {
     }
     loop {
         state.rescan_wanted.store(false, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        tracing::info!(reason, "scan starting");
         let result = {
             // A scan can run for minutes over external drives. Holding the
             // shared connection would block every synchronous command, and
@@ -44,6 +46,17 @@ pub fn refresh(app: &AppHandle, reason: &str) {
                 Err(e) => Err(e.to_string()),
             }
         };
+        match &result {
+            Ok(s) => tracing::info!(
+                reason,
+                ms = started.elapsed().as_millis() as u64,
+                files = s.files_seen,
+                added = s.added,
+                removed = s.removed,
+                "scan finished"
+            ),
+            Err(e) => tracing::error!(reason, "scan failed: {e}"),
+        }
         match result {
             Ok(stats) => {
                 let _ = app.emit("scan-done", ScanDone { reason: reason.to_string(), stats: stats.clone() });

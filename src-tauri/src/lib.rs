@@ -194,6 +194,7 @@ pub fn run() {
             commands::set_magnet_handler,
             commands::pending_open_urls,
             commands::reveal_log,
+            commands::log_frontend,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

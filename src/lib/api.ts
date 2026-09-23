@@ -1,4 +1,6 @@
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { convertFileSrc } from "@tauri-apps/api/core";
+// Every command is timed; anything slow enough to block a frame is logged.
+import { timedInvoke as invoke } from "./diag";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export interface Library {
