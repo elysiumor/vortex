@@ -11,9 +11,40 @@ import { invoke } from "@tauri-apps/api/core";
 const SLOW_CALL_MS = 250;
 const LONG_TASK_MS = 200;
 
+/**
+ * Messages raised before the IPC bridge is ready. Diagnostics start at module
+ * load, which can be earlier than Tauri is willing to accept a command, and a
+ * dropped message here is exactly the one worth keeping: it describes startup.
+ */
+const pending: Array<[string, string]> = [];
+let bridgeReady = false;
+let flushing = false;
+
+function flush() {
+  if (flushing || pending.length === 0) return;
+  flushing = true;
+  const [level, message] = pending[0];
+  invoke("log_frontend", { level, message })
+    .then(() => {
+      bridgeReady = true;
+      pending.shift();
+      flushing = false;
+      flush();
+    })
+    .catch(() => {
+      // Bridge not up yet, or the command failed. Retry, but do not spin.
+      flushing = false;
+      if (pending.length > 200) pending.splice(0, pending.length - 200);
+      setTimeout(flush, bridgeReady ? 1000 : 250);
+    });
+}
+
 function send(level: "info" | "warn" | "error", message: string) {
-  // Never await, and never let logging throw into the caller's path.
-  invoke("log_frontend", { level, message }).catch(() => {});
+  // Mirrored to the console so `tauri dev` shows it even with no bridge.
+  if (level === "error") console.error("[vortex]", message);
+  else if (level === "warn") console.warn("[vortex]", message);
+  pending.push([level, message]);
+  flush();
 }
 
 /** Wraps `invoke` so any slow command lands in the log with its duration. */
