@@ -3,6 +3,7 @@ mod commands;
 mod db;
 mod deeplink;
 mod jobs;
+mod logging;
 mod parser;
 mod player;
 mod probe;
@@ -32,6 +33,20 @@ pub struct AppState {
     pub torrent_start: Mutex<()>,
 }
 
+/// Send panics to the log with a backtrace. A panic in a background task is
+/// invisible otherwise, and it is exactly the thing worth seeing.
+fn log_panics() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!(
+            thread = std::thread::current().name().unwrap_or("unnamed"),
+            backtrace = %std::backtrace::Backtrace::force_capture(),
+            "PANIC: {info}"
+        );
+        previous(info);
+    }));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -47,6 +62,8 @@ pub fn run() {
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
+            logging::init(&dir);
+            log_panics();
             let db_path = dir.join("vortex.db");
             let conn = db::open(&db_path)?;
             // Keys saved before the connected flag existed were verified with "Test & save".
@@ -98,6 +115,8 @@ pub fn run() {
                 if jobs::setting_on(window.app_handle(), "close_to_tray", true) {
                     let _ = window.hide();
                     api.prevent_close();
+                } else {
+                    logging::closing("window closed");
                 }
             }
         })
@@ -174,6 +193,7 @@ pub fn run() {
             commands::torrent_discard,
             commands::set_magnet_handler,
             commands::pending_open_urls,
+            commands::reveal_log,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

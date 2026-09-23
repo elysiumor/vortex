@@ -359,6 +359,8 @@ export const api = {
   onScanDone: (cb: (p: ScanDone) => void): Promise<UnlistenFn> =>
     listen<ScanDone>("scan-done", (ev) => cb(ev.payload)),
   quitApp: () => invoke<void>("quit_app"),
+  /** Show vortex.log in Explorer, for sending on when something breaks. */
+  revealLog: () => invoke<void>("reveal_log"),
   onDurationsDone: (cb: (p: DurationProgress) => void): Promise<UnlistenFn> =>
     listen<DurationProgress>("durations-done", (ev) => cb(ev.payload)),
 

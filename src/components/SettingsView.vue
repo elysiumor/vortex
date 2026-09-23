@@ -2,7 +2,7 @@
 import { onMounted, onUnmounted, ref } from "vue";
 import { toast } from "vue-sonner";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { FolderPlus, HardDrive, RefreshCw, Trash2, Check, Download, Upload, Sun, Moon, Monitor, KeyRound, Power } from "@lucide/vue";
+import { FolderPlus, HardDrive, RefreshCw, Trash2, Check, Download, Upload, Sun, Moon, Monitor, KeyRound, Power, FileText } from "@lucide/vue";
 import { api, type DetectedPlayer, type Drive, type Library, type PosterProgress, type ScanStats, type TorrentStatus } from "../lib/api";
 import { applyTheme, loadTheme, type Theme } from "../lib/theme";
 import { Button } from "@/components/ui/button";
@@ -196,6 +196,10 @@ onUnmounted(() => unlisteners.forEach((u) => u()));
         <div v-for="[key, label, hint] in flagRows" :key="key" class="flex items-center justify-between gap-4">
           <div><div class="text-sm font-medium">{{ label }}</div><div class="text-xs text-muted-foreground">{{ hint }}</div></div>
           <Switch :model-value="flags[key]" @update:model-value="(v: boolean) => setFlag(key, v)" />
+        </div>
+        <div class="flex items-center justify-between gap-4">
+          <div><div class="text-sm font-medium">Session log</div><div class="text-xs text-muted-foreground">Everything Vortex and the torrent engine did this run, plus the previous run. Attach it to a bug report.</div></div>
+          <Button variant="outline" size="sm" @click="api.revealLog()"><FileText /> Show log</Button>
         </div>
         <div class="flex justify-end"><Button variant="outline" size="sm" @click="api.quitApp()"><Power /> Quit Vortex</Button></div>
       </CardContent>

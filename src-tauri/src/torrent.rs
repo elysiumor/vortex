@@ -155,7 +155,8 @@ const STREAM_HEAD_FRACTION: f64 = 0.02;
 const STREAM_HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 pub struct Engine {
-    rt: Runtime,
+    /// Always `Some` while the engine lives; `None` only during `Drop`.
+    rt: Option<Runtime>,
     session: Arc<Session>,
     stream_port: u16,
     proxy: Option<String>,
@@ -229,6 +230,18 @@ pub struct SessionStatus {
     pub peers_live: u64,
     pub uptime_secs: u64,
     pub protected: bool,
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // Dropping a tokio Runtime blocks until its tasks and blocking threads
+        // finish, and ours owns an HTTP server loop plus a watcher per torrent.
+        // Doing that on whoever released the last Arc would stall a command, or
+        // the UI thread. Hand it off instead.
+        if let Some(rt) = self.rt.take() {
+            rt.shutdown_background();
+        }
+    }
 }
 
 fn anyhow_str(e: anyhow::Error) -> String {
@@ -352,7 +365,7 @@ impl Engine {
         let dests = std::fs::read(&dests_file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         let api = Api::new(session.clone(), None, None);
         let engine = Arc::new(Engine {
-            rt,
+            rt: Some(rt),
             session,
             stream_port,
             proxy,
@@ -369,7 +382,7 @@ impl Engine {
         for h in handles {
             let ephemeral = engine.dest_for(&h.info_hash().as_string()).map(|d| d.ephemeral).unwrap_or(false);
             if ephemeral {
-                let _ = engine.rt.block_on(engine.session.pause(&h));
+                let _ = engine.rt().block_on(engine.session.pause(&h));
             } else {
                 engine.watch(app.clone(), h);
             }
@@ -377,13 +390,16 @@ impl Engine {
         Ok(engine)
     }
 
+    fn rt(&self) -> &Runtime {
+        self.rt.as_ref().expect("runtime is taken only in Drop")
+    }
+
     pub fn protected(&self) -> bool {
         self.proxy.is_some()
     }
 
-    pub fn stop(self: Arc<Self>) {
-        self.rt.block_on(self.session.stop());
-        // The runtime shuts down in the background when the last Arc drops.
+    pub fn stop(&self) {
+        self.rt().block_on(self.session.stop());
     }
 
     /// Turn the user's input into something librqbit accepts. In proxy mode
@@ -422,7 +438,7 @@ impl Engine {
         // A magnet with no reachable peers never resolves, so bound the wait
         // rather than leave the caller spinning forever.
         let resp = self
-            .rt
+            .rt()
             .block_on(async { tokio::time::timeout(METADATA_TIMEOUT, self.session.add_torrent(add, Some(opts))).await })
             .map_err(|_| {
                 if self.protected() {
@@ -513,7 +529,7 @@ impl Engine {
             output_folder: Some(staging.to_string_lossy().to_string()),
             ..Default::default()
         };
-        let resp = self.rt.block_on(self.session.add_torrent(add, Some(opts))).map_err(anyhow_str)?;
+        let resp = self.rt().block_on(self.session.add_torrent(add, Some(opts))).map_err(anyhow_str)?;
         match resp {
             AddTorrentResponse::Added(id, handle) => {
                 self.remember_dest(&handle.info_hash().as_string(), Some(dest));
@@ -583,16 +599,16 @@ impl Engine {
 
     pub fn pause(&self, id: usize) -> Result<(), String> {
         let t = self.session.get(TorrentIdOrHash::Id(id)).ok_or("torrent not found")?;
-        self.rt.block_on(self.session.pause(&t)).map_err(anyhow_str)
+        self.rt().block_on(self.session.pause(&t)).map_err(anyhow_str)
     }
 
     pub fn resume(&self, id: usize) -> Result<(), String> {
         let t = self.session.get(TorrentIdOrHash::Id(id)).ok_or("torrent not found")?;
-        self.rt.block_on(self.session.unpause(&t)).map_err(anyhow_str)
+        self.rt().block_on(self.session.unpause(&t)).map_err(anyhow_str)
     }
 
     pub fn remove(&self, id: usize, delete_files: bool) -> Result<(), String> {
-        self.rt.block_on(self.session.delete(TorrentIdOrHash::Id(id), delete_files)).map_err(anyhow_str)
+        self.rt().block_on(self.session.delete(TorrentIdOrHash::Id(id), delete_files)).map_err(anyhow_str)
     }
 
     pub fn detail(&self, id: usize) -> Result<TorrentDetail, String> {
@@ -749,7 +765,7 @@ impl Engine {
             }
         }
         // Already added (streamed before, or downloading): just play it.
-        let existing = self.rt.block_on(async {
+        let existing = self.rt().block_on(async {
             let add = self.to_add(source).ok()?;
             match self.session.add_torrent(add, Some(AddTorrentOptions { list_only: true, ..Default::default() })).await {
                 Ok(AddTorrentResponse::AlreadyManaged(id, _)) => Some(id),
@@ -783,9 +799,9 @@ impl Engine {
     pub fn stream_existing(self: &Arc<Self>, app: &AppHandle, id: usize) -> Result<StreamStarted, String> {
         let t = self.session.get(TorrentIdOrHash::Id(id)).ok_or("torrent not found")?;
         if t.is_paused() {
-            self.rt.block_on(self.session.unpause(&t)).map_err(anyhow_str)?;
+            self.rt().block_on(self.session.unpause(&t)).map_err(anyhow_str)?;
         }
-        self.rt.block_on(t.wait_until_initialized()).map_err(anyhow_str)?;
+        self.rt().block_on(t.wait_until_initialized()).map_err(anyhow_str)?;
         let only = t.only_files();
         let file = t
             .with_metadata(|m| {
@@ -842,7 +858,7 @@ impl Engine {
             // Keep or Watch starts it again. Downloads carry on regardless.
             if ephemeral && !finished {
                 if let Some(t) = &handle {
-                    let _ = engine.rt.block_on(engine.session.pause(t));
+                    let _ = engine.rt().block_on(engine.session.pause(t));
                 }
             }
             // Resume point, unless the player ran to (near) the end.
@@ -871,7 +887,7 @@ impl Engine {
             self.remember_dest(&hash, Some(d));
         }
         if t.is_paused() {
-            self.rt.block_on(self.session.unpause(&t)).map_err(anyhow_str)?;
+            self.rt().block_on(self.session.unpause(&t)).map_err(anyhow_str)?;
         }
         self.watch(app.clone(), t);
         Ok(())
@@ -901,7 +917,7 @@ impl Engine {
             }
         }
         if t.is_paused() {
-            self.rt.block_on(self.session.unpause(&t)).map_err(anyhow_str)?;
+            self.rt().block_on(self.session.unpause(&t)).map_err(anyhow_str)?;
         }
         let base = name.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
         Ok(format!("http://127.0.0.1:{}/torrents/{id}/stream/{file}/{}", self.stream_port, urlencoding::encode(&base)))
@@ -911,7 +927,7 @@ impl Engine {
     /// library folder and let the scanner take it from there.
     fn watch(self: &Arc<Self>, app: AppHandle, t: Arc<ManagedTorrent>) {
         let engine = self.clone();
-        self.rt.spawn(async move {
+        self.rt().spawn(async move {
             if t.wait_until_completed().await.is_err() {
                 return; // removed before it finished
             }
@@ -1138,6 +1154,9 @@ pub fn restart(app: &AppHandle) -> Result<Status, String> {
     let old = state.torrent.lock().map_err(|e| e.to_string())?.take();
     if let Some(e) = old {
         e.stop();
+        // Release our reference off this thread: whoever drops the last Arc
+        // pays for the runtime shutdown, and it should not be a command.
+        std::thread::spawn(move || drop(e));
     }
     let result = ensure(app);
     Ok(status(app, result.err()))

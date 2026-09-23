@@ -44,6 +44,8 @@ librqbit-core = { version = "9", default-features = false, features = ["sha1-cry
 reqwest13 = { package = "reqwest", version = "0.13", default-features = false, features = ["native-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 librqbit-dualstack-sockets = "0.7"
 
 [target.'cfg(windows)'.dependencies]
@@ -55,5 +57,10 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
-strip = true
+# Unwind rather than abort: a panic in one background task then kills that
+# task instead of the whole app. Line tables are kept so the backtrace in
+# crash.log names a file and line. Both cost binary size and can be tightened
+# again once the crash reports stop arriving.
+panic = "unwind"
+debug = "line-tables-only"
+strip = false

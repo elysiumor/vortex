@@ -49,7 +49,15 @@ pub async fn scan_libraries(app: AppHandle, state: State<'_, AppState>) -> R<Sca
 
 #[tauri::command]
 pub fn quit_app(app: AppHandle) {
+    crate::logging::closing("quit from the app");
     app.exit(0);
+}
+
+/// Show the session log in Explorer, for sending on when something breaks.
+#[tauri::command]
+pub fn reveal_log(app: AppHandle) -> R<()> {
+    let dir = app.path().app_data_dir().map_err(err)?;
+    reveal_path(dir.join("vortex.log").to_string_lossy().to_string())
 }
 
 // ---- browsing ----
