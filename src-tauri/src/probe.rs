@@ -16,6 +16,14 @@ const FFPROBE_CANDIDATES: &[&str] = &[
     r"C:\ProgramData\chocolatey\bin\ffprobe.exe",
 ];
 
+/// Detection result for this run. Where ffprobe lives does not change while
+/// the app is open, and finding out costs a subprocess plus a directory walk.
+static DETECTED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+pub fn detect_ffprobe_cached() -> Option<String> {
+    DETECTED.get_or_init(detect_ffprobe).clone()
+}
+
 pub fn detect_ffprobe() -> Option<String> {
     if let Ok(out) = Command::new("where").arg("ffprobe").output() {
         if out.status.success() {
@@ -99,12 +107,22 @@ pub fn probe_missing(app: AppHandle) -> Result<(), String> {
     if state.probing.swap(true, Ordering::SeqCst) {
         return Err("Duration scan already running".into());
     }
-    let (ffprobe, items) = {
+    let (configured, items) = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
         let configured = db::get_setting(&conn, "ffprobe_path").map_err(|e| e.to_string())?;
-        let ffprobe = configured.filter(|p| !p.is_empty() && Path::new(p).exists()).or_else(detect_ffprobe);
-        (ffprobe, db::episodes_missing_duration(&conn).map_err(|e| e.to_string())?)
+        (configured, db::episodes_missing_duration(&conn).map_err(|e| e.to_string())?)
     };
+    // Nothing to do: don't go looking for ffprobe at all. This is the common
+    // case after a scan, and it used to cost a subprocess every time.
+    if items.is_empty() {
+        state.probing.store(false, Ordering::SeqCst);
+        let _ = app.emit("durations-done", Progress { done: 0, total: 0, found: 0 });
+        return Ok(());
+    }
+    // Detection runs outside the lock. It spawns `where` and walks the WinGet
+    // package tree, which takes long enough on Windows to stall every
+    // synchronous command, and those run on the main thread.
+    let ffprobe = configured.filter(|p| !p.is_empty() && Path::new(p).exists()).or_else(detect_ffprobe_cached);
     std::thread::spawn(move || {
         let total = items.len();
         let mut found = 0;

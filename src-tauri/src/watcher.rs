@@ -31,14 +31,19 @@ fn run(app: AppHandle) {
     loop {
         // Add watches for libraries that are available and not watched yet
         // (covers newly added folders and a reconnected external drive).
-        let libs = {
+        let mut libs = {
             let state = app.state::<AppState>();
             let guard = state.db.lock();
             match guard {
-                Ok(conn) => db::list_libraries(&conn).unwrap_or_default(),
+                Ok(conn) => db::list_libraries_rows(&conn).unwrap_or_default(),
                 Err(_) => Vec::new(),
             }
         };
+        // Probing a sleeping or disconnected drive can block for seconds, and
+        // this loop runs every 20s. Doing it under the lock would stall every
+        // synchronous command, which Tauri runs on the main thread.
+        db::fill_availability(&mut libs);
+        let libs = libs;
         let mut newly_available = false;
         for lib in &libs {
             if lib.available && !watched.contains(&lib.path) {

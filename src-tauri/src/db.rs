@@ -218,18 +218,31 @@ FROM episodes e LEFT JOIN watch_progress w ON w.episode_id = e.id
 
 // ---------- libraries ----------
 
-pub fn list_libraries(conn: &Connection) -> rusqlite::Result<Vec<Library>> {
+/// Rows only, with `available` left false. Deciding availability means
+/// touching the filesystem, which blocks for seconds on a sleeping, network
+/// or disconnected drive; callers fill it in via `fill_availability` after
+/// releasing the database lock.
+pub fn list_libraries_rows(conn: &Connection) -> rusqlite::Result<Vec<Library>> {
     let mut stmt = conn.prepare("SELECT id, path, name FROM libraries ORDER BY name")?;
     let rows = stmt.query_map([], |r| {
-        let path: String = r.get(1)?;
-        Ok(Library {
-            id: r.get(0)?,
-            available: Path::new(&path).is_dir(),
-            path,
-            name: r.get(2)?,
-        })
+        Ok(Library { id: r.get(0)?, available: false, path: r.get(1)?, name: r.get(2)? })
     })?;
     rows.collect()
+}
+
+/// Probe each path. Must not run while the database lock is held.
+pub fn fill_availability(libs: &mut [Library]) {
+    for lib in libs {
+        lib.available = Path::new(&lib.path).is_dir();
+    }
+}
+
+/// Convenience for callers that already own their connection (a scan), where
+/// blocking on a drive costs nobody else anything.
+pub fn list_libraries(conn: &Connection) -> rusqlite::Result<Vec<Library>> {
+    let mut libs = list_libraries_rows(conn)?;
+    fill_availability(&mut libs);
+    Ok(libs)
 }
 
 pub fn add_library(conn: &Connection, path: &str) -> rusqlite::Result<Library> {

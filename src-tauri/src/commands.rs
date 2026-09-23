@@ -20,9 +20,19 @@ fn err<E: std::fmt::Display>(e: E) -> String {
 // ---- libraries ----
 
 #[tauri::command]
-pub fn list_libraries(state: State<AppState>) -> R<Vec<Library>> {
-    let conn = state.db.lock().map_err(err)?;
-    db::list_libraries(&conn).map_err(err)
+pub async fn list_libraries(app: AppHandle) -> R<Vec<Library>> {
+    // Probing each path can block for seconds on a sleeping or disconnected
+    // drive, so it happens off the main thread and outside the lock.
+    blocking(move || {
+        let mut libs = {
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().map_err(err)?;
+            db::list_libraries_rows(&conn).map_err(err)?
+        };
+        db::fill_availability(&mut libs);
+        Ok(libs)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -151,13 +161,23 @@ pub fn find_duplicates(state: State<AppState>) -> R<Vec<DuplicateGroup>> {
 
 /// Move a file to the Recycle Bin and drop it from the library.
 #[tauri::command]
-pub fn trash_episode(state: State<AppState>, episode_id: i64) -> R<()> {
-    let conn = state.db.lock().map_err(err)?;
-    let ep = db::get_episode(&conn, episode_id).map_err(err)?.ok_or("episode not found")?;
-    if std::path::Path::new(&ep.path).exists() {
-        trash::delete(&ep.path).map_err(|e| format!("could not move to Recycle Bin: {e}"))?;
-    }
-    db::delete_episode(&conn, episode_id).map_err(err)
+pub async fn trash_episode(app: AppHandle, episode_id: i64) -> R<()> {
+    blocking(move || {
+        let state = app.state::<AppState>();
+        // Look up and delete the row under the lock, but send the file to the
+        // Recycle Bin with the lock released: that is a shell call and can take
+        // a noticeable moment on a slow or removable drive.
+        let ep = {
+            let conn = state.db.lock().map_err(err)?;
+            db::get_episode(&conn, episode_id).map_err(err)?.ok_or("episode not found")?
+        };
+        if std::path::Path::new(&ep.path).exists() {
+            trash::delete(&ep.path).map_err(|e| format!("could not move to Recycle Bin: {e}"))?;
+        }
+        let conn = state.db.lock().map_err(err)?;
+        db::delete_episode(&conn, episode_id).map_err(err)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -205,8 +225,10 @@ pub fn set_item_watched(state: State<AppState>, media_item_id: i64, watched: boo
 // ---- playback ----
 
 #[tauri::command]
-pub fn play_episode(app: AppHandle, episode_id: i64) -> R<bool> {
-    player::play(app, episode_id)
+pub async fn play_episode(app: AppHandle, episode_id: i64) -> R<bool> {
+    // Launching the player is a process spawn, which is far too slow to do on
+    // the main thread: the window would stop repainting until it returned.
+    blocking(move || player::play(app, episode_id)).await
 }
 
 /// Open Windows Explorer with the file selected.
@@ -231,8 +253,10 @@ pub fn probe_durations(app: AppHandle) -> R<()> {
 }
 
 #[tauri::command]
-pub fn detect_ffprobe() -> Option<String> {
-    probe::detect_ffprobe()
+pub async fn detect_ffprobe() -> Option<String> {
+    // Off the main thread and cached: this spawns `where` and walks the WinGet
+    // package tree, which is far too slow to do while the UI waits.
+    tauri::async_runtime::spawn_blocking(probe::detect_ffprobe_cached).await.unwrap_or(None)
 }
 
 // ---- TMDB ----
@@ -417,7 +441,13 @@ pub struct Drive {
 }
 
 #[tauri::command]
-pub fn list_drives() -> Vec<Drive> {
+pub async fn list_drives() -> Vec<Drive> {
+    // Enumerating volumes touches every mount, including network and removable
+    // ones that may be asleep, so keep it off the main thread.
+    tauri::async_runtime::spawn_blocking(list_drives_blocking).await.unwrap_or_default()
+}
+
+fn list_drives_blocking() -> Vec<Drive> {
     let disks = sysinfo::Disks::new_with_refreshed_list();
     let mut out: Vec<Drive> = disks
         .iter()
