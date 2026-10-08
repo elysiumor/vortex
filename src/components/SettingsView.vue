@@ -2,23 +2,21 @@
 import { onMounted, onUnmounted, ref } from "vue";
 import { toast } from "vue-sonner";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { FolderPlus, HardDrive, RefreshCw, Trash2, Check, Download, Upload, Sun, Moon, Monitor, KeyRound, Power, FileText, FolderOpen, FilePen } from "@lucide/vue";
-import { api, type DetectedPlayer, type Drive, type Library, type PosterProgress, type ScanStats, type TmdbStore, type TorrentStatus } from "../lib/api";
+import { FolderPlus, HardDrive, RefreshCw, Trash2, Check, Download, Upload, Sun, Moon, Monitor, Power, FileText, FolderOpen, Clapperboard } from "@lucide/vue";
+import { api, type DetectedPlayer, type Drive, type Library, type ScanStats, type TorrentStatus } from "../lib/api";
 import { applyTheme, currentTheme, type Theme } from "../lib/theme";
-import RenameDialog from "./RenameDialog.vue";
 import { Button } from "@/components/ui/button";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { Progress } from "@/components/ui/progress";
-import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
 
-const emit = defineEmits<{ scanned: [] }>();
+const emit = defineEmits<{ scanned: []; go: [page: "tmdb"] }>();
 
 // ---- general ----
 // Shared with the top bar and Ctrl+K, so a change there shows here too.
@@ -55,7 +53,22 @@ async function addFolder() {
   await loadLibraries();
   await scan();
 }
-async function remove(lib: Library) { await api.removeLibrary(lib.id); await loadLibraries(); emit("scanned"); }
+// Removal asks first: it drops every file under the folder from Vortex,
+// with its watch progress and history, though nothing on disk is touched.
+// The dialog clears the ref as it closes, so the target is held outside it.
+const removePending = ref<Library | null>(null);
+let removeTarget: Library | null = null;
+function askRemove(lib: Library) { removeTarget = lib; removePending.value = lib; }
+async function confirmRemove() {
+  const lib = removeTarget;
+  removeTarget = null;
+  removePending.value = null;
+  if (!lib) return;
+  try { await api.removeLibrary(lib.id); toast(`Removed ${lib.path} from the library`); }
+  catch (e) { toast.error(String(e)); }
+  await loadLibraries();
+  emit("scanned");
+}
 async function scan() {
   scanning.value = true;
   try { lastScan.value = await api.scanLibraries(); emit("scanned"); const s = lastScan.value; toast.success(`Scan done: ${s.files_seen} files, ${s.added} added, ${s.removed} removed`); }
@@ -85,34 +98,6 @@ const durationResult = ref("");
 async function saveFfprobe() { await api.setSetting("ffprobe_path", ffprobePath.value.trim()); }
 async function browseFfprobe() { const p = await open({ multiple: false, filters: [{ name: "ffprobe", extensions: ["exe"] }] }); if (p) { ffprobePath.value = p as string; await saveFfprobe(); } }
 async function probeNow() { probing.value = true; durationResult.value = ""; try { await api.probeDurations(); } catch (e) { probing.value = false; toast.error(String(e)); } }
-
-// ---- TMDB ----
-const tmdbKey = ref("");
-const tmdbMasked = ref<string | null>(null);
-const tmdbStatus = ref("");
-const tmdbBusy = ref(false);
-const confirmRemove = ref(false);
-const posterProgress = ref<PosterProgress | null>(null);
-const fetching = ref(false);
-async function connectTmdb() {
-  tmdbBusy.value = true; tmdbStatus.value = "";
-  try { await api.connectTmdb(tmdbKey.value); tmdbKey.value = ""; tmdbMasked.value = await api.tmdbStatus(); toast.success("TMDB connected"); }
-  catch (e) { tmdbStatus.value = String(e); } finally { tmdbBusy.value = false; }
-}
-async function removeTmdb() { await api.disconnectTmdb(); tmdbMasked.value = null; confirmRemove.value = false; toast("TMDB key removed. Existing posters are kept."); }
-// ---- rename to TMDb names ----
-const renameOpen = ref(false);
-const canUndoRename = ref(false);
-const store = ref<TmdbStore | null>(null);
-async function refreshStore() { store.value = await api.tmdbStore().catch(() => null); }
-async function refreshUndo() { canUndoRename.value = await api.renameCanUndo().catch(() => false); }
-async function afterRename() { await refreshUndo(); emit("scanned"); }
-async function undoRename() {
-  try { const n = await api.renameUndo(); toast(`Rename undone (${n} change${n === 1 ? "" : "s"} reversed)`); }
-  catch (e) { toast.error(String(e)); }
-  await afterRename();
-}
-async function fetchPosters(force: boolean) { try { fetching.value = true; posterProgress.value = null; await api.fetchPosters(force); } catch (e) { fetching.value = false; toast.error(String(e)); } }
 
 // ---- player ----
 const players = ref<DetectedPlayer[]>([]);
@@ -191,7 +176,6 @@ async function load() {
   players.value = await api.detectPlayers();
   const s = await api.getSettings();
   playerKind.value = s.player_kind ?? ""; playerPath.value = s.player_path ?? "";
-  tmdbMasked.value = await api.tmdbStatus();
   ignoreDirs.value = s.ignore_dirs ?? ""; defaultIgnored.value = await api.defaultIgnoredDirs();
   lastBackup.value = s.last_backup ?? ""; lastBackupPath.value = s.last_backup_path ?? "";
   for (const k of Object.keys(flags.value)) if (s[k] !== undefined) flags.value[k] = s[k] === "1";
@@ -213,20 +197,7 @@ onMounted(async () => {
   // shows the probe that is already going instead of offering a second one.
   keep(await api.onDurationsProgress(() => { probing.value = true; }));
   keep(await api.onDurationsDone((p) => { probing.value = false; durationResult.value = p.total === 0 ? "All files already have a duration" : `Read ${p.found} of ${p.total} files`; }));
-  keep(await api.onPosterProgress((p) => { fetching.value = true; posterProgress.value = p; }));
-  // Deliberately no emit("scanned") here. That runs onScanned, which starts
-  // another poster fetch, which finishes and lands back on this handler: an
-  // endless loop of fetches and toasts. App.vue already refreshes the views on
-  // this same event.
-  keep(await api.onPostersDone((p) => {
-    fetching.value = false;
-    posterProgress.value = p;
-    if (p.current) toast.error(`Poster fetch stopped: ${p.current}`);
-    else if (p.total > 0) toast(`Posters: ${p.matched} of ${p.total} matched`);
-  }));
   if (!unmounted) await load();
-  if (!unmounted) await refreshUndo();
-  if (!unmounted) await refreshStore();
 });
 onUnmounted(() => { unmounted = true; unlisteners.forEach((u) => u()); });
 </script>
@@ -264,7 +235,8 @@ onUnmounted(() => { unmounted = true; unlisteners.forEach((u) => u()); });
         <div v-for="lib in libraries" :key="lib.id" class="flex items-center gap-3 rounded-lg border px-3 py-2">
           <span class="size-2 shrink-0 rounded-full" :class="lib.available ? 'bg-success' : 'bg-destructive'" :title="lib.available ? 'Connected' : 'Not available'"></span>
           <span class="min-w-0 flex-1 truncate text-sm" :title="lib.path">{{ lib.path }}</span>
-          <Button size="sm" variant="ghost" class="text-destructive" @click="remove(lib)"><Trash2 /> Remove</Button>
+          <span class="shrink-0 text-xs text-muted-foreground">{{ lib.file_count }} file{{ lib.file_count === 1 ? "" : "s" }}</span>
+          <Button size="sm" variant="outline" class="shrink-0 text-destructive hover:text-destructive" @click="askRemove(lib)"><Trash2 /> Remove</Button>
         </div>
         <div class="flex flex-wrap items-center gap-2">
           <Button @click="addFolder"><FolderPlus /> Add folder</Button>
@@ -342,40 +314,9 @@ onUnmounted(() => { unmounted = true; unlisteners.forEach((u) => u()); });
     </Card>
 
     <Card>
-      <CardHeader><CardTitle>Posters &amp; details (TMDB)</CardTitle><CardDescription>Free key from themoviedb.org → Settings → API. Either the short v3 key or the long v4 read token works. Everything is cached locally.</CardDescription></CardHeader>
-      <CardContent class="space-y-3">
-        <div v-if="tmdbMasked" class="flex items-center gap-2">
-          <Input :model-value="tmdbMasked" disabled class="max-w-xs" />
-          <Badge variant="outline" class="border-success/50 text-success"><KeyRound /> Connected</Badge>
-          <Button variant="ghost" size="sm" class="text-destructive" @click="confirmRemove = true">Remove</Button>
-          <div class="flex-1"></div>
-          <Button size="sm" :disabled="fetching" @click="fetchPosters(false)">{{ fetching ? "Fetching…" : "Fetch missing posters" }}</Button>
-          <Button size="sm" variant="outline" :disabled="fetching" @click="fetchPosters(true)">Retry unmatched</Button>
-        </div>
-        <div v-else class="flex gap-2">
-          <Input v-model="tmdbKey" type="password" placeholder="Paste your key" @keyup.enter="connectTmdb" />
-          <Button :disabled="tmdbBusy || !tmdbKey.trim()" @click="connectTmdb">{{ tmdbBusy ? "Checking…" : "Add" }}</Button>
-        </div>
-        <p class="text-xs text-destructive" v-if="tmdbStatus">{{ tmdbStatus }}</p>
-        <div v-if="posterProgress && posterProgress.total > 0">
-          <Progress :model-value="100 * posterProgress.done / posterProgress.total" class="h-1.5" />
-          <div class="mt-1 text-xs text-muted-foreground">{{ posterProgress.done }} / {{ posterProgress.total }} · {{ posterProgress.matched }} matched<span v-if="fetching && posterProgress.current"> · {{ posterProgress.current }}</span></div>
-        </div>
-        <p v-if="store && store.titles > 0" class="text-xs text-muted-foreground">
-          Saved on this PC: {{ store.titles }} matched title{{ store.titles === 1 ? "" : "s" }}, {{ store.images }} images ({{ (store.image_bytes / 1048576).toFixed(0) }} MB).
-          Folders you switch back to get their posters and details from here, without asking TMDb.
-        </p>
-        <div v-if="tmdbMasked" class="flex flex-wrap items-center gap-2 border-t pt-3">
-          <div class="min-w-0 flex-1">
-            <div class="text-sm font-medium">Rename files to TMDb names</div>
-            <div class="text-xs text-muted-foreground">Movies like Inception (2010).mkv, episodes like Dark (2017) - S01E01 - Secrets.mkv, anime included. You see every change first.</div>
-          </div>
-          <Button size="sm" variant="outline" @click="renameOpen = true"><FilePen /> Review renames…</Button>
-          <Button size="sm" variant="ghost" :disabled="!canUndoRename" @click="undoRename">Undo last rename</Button>
-        </div>
-      </CardContent>
+      <CardHeader><CardTitle>Posters &amp; details (TMDb)</CardTitle><CardDescription>The key, matching rules, language, fetch tools, unmatched titles and file renaming have a page of their own.</CardDescription></CardHeader>
+      <CardContent><Button variant="outline" size="sm" @click="emit('go', 'tmdb')"><Clapperboard /> Open TMDb settings</Button></CardContent>
     </Card>
-    <RenameDialog v-model:open="renameOpen" :ids="null" @done="afterRename" />
 
     <Card>
       <CardHeader><CardTitle>File durations</CardTitle><CardDescription>MKV, WebM, MP4, M4V and MOV are read directly. For AVI, WMV, TS and others, point to ffprobe.exe from FFmpeg.</CardDescription></CardHeader>
@@ -431,10 +372,13 @@ onUnmounted(() => { unmounted = true; unlisteners.forEach((u) => u()); });
       </AlertDialogContent>
     </AlertDialog>
 
-    <AlertDialog v-model:open="confirmRemove">
+    <AlertDialog :open="!!removePending" @update:open="(v) => !v && (removePending = null)">
       <AlertDialogContent>
-        <AlertDialogHeader><AlertDialogTitle>Remove the TMDB key?</AlertDialogTitle><AlertDialogDescription>Posters already downloaded stay. New titles won't get posters or episode names until a key is added again.</AlertDialogDescription></AlertDialogHeader>
-        <AlertDialogFooter><AlertDialogCancel>Cancel</AlertDialogCancel><AlertDialogAction class="bg-destructive text-white hover:bg-destructive/90" @click="removeTmdb">Remove key</AlertDialogAction></AlertDialogFooter>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Remove this folder from the library?</AlertDialogTitle>
+          <AlertDialogDescription class="break-all">{{ removePending?.path }}<br /><span class="mt-2 block">Its {{ removePending?.file_count }} file{{ removePending?.file_count === 1 ? "" : "s" }} leave Vortex, along with their watch progress and history. Nothing on disk is deleted, and adding the folder again brings the titles back with their TMDb data.</span></AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter><AlertDialogCancel>Cancel</AlertDialogCancel><AlertDialogAction class="bg-destructive text-white hover:bg-destructive/90" @click="confirmRemove">Remove folder</AlertDialogAction></AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
 

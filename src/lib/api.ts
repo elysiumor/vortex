@@ -22,6 +22,18 @@ export interface Library {
   path: string;
   name: string;
   available: boolean;
+  /** Video files filed under it, for the removal prompt. */
+  file_count: number;
+}
+
+/** What a background job is doing; `running` false is its last word. */
+export interface JobProgress {
+  job: "scan" | "posters" | "durations" | "rename" | "memory";
+  label: string;
+  done: number;
+  total: number;
+  detail: string | null;
+  running: boolean;
 }
 
 export interface MediaItem {
@@ -374,6 +386,11 @@ export const api = {
   search: (query: string) => invoke<SearchResults>("search", { query }),
   fetchEpisodeTitles: (mediaItemId: number) => invoke<number>("fetch_episode_titles", { mediaItemId }),
   fetchPosters: (force = false) => invoke<void>("fetch_posters", { force }),
+  /** Stop the running poster fetch at the next title. */
+  cancelPosters: () => invoke<void>("cancel_posters"),
+  /** Progress of every background job on one channel. */
+  onJobProgress: (cb: (p: JobProgress) => void): Promise<UnlistenFn> =>
+    listen<JobProgress>("job-progress", (ev) => cb(ev.payload)),
   searchTmdb: (kind: "movie" | "series", query: string, year: number | null) =>
     invoke<TmdbMatch[]>("search_tmdb", { kind, query, year }),
   applyTmdbMatch: (mediaItemId: number, m: TmdbMatch) => invoke<void>("apply_tmdb_match", { mediaItemId, m }),
@@ -393,6 +410,8 @@ export const api = {
   setItemCategory: (mediaItemId: number, category: string | null) =>
     invoke<void>("set_item_category", { mediaItemId, category }),
   getMediaItem: (id: number) => invoke<MediaItem | null>("get_media_item", { id }),
+  /** The title now holding any of these files, after a rescan replaced the old one. */
+  itemForPaths: (paths: string[]) => invoke<number | null>("item_for_paths", { paths }),
   listEpisodes: (mediaItemId: number) => invoke<Episode[]>("list_episodes", { mediaItemId }),
   continueWatching: () => invoke<ContinueItem[]>("continue_watching"),
 

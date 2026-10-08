@@ -13,6 +13,8 @@ Vortex catalogues the films and series scattered across your PC and external dri
 - **Runs quietly.** System tray, folder watcher with Windows notifications, rescan on startup, one-file backup and restore.
 - **Downloads, bring your own links.** Paste a magnet link or open a .torrent file, pick which files you want, stream a video in your player while it downloads, and find it in your library when it finishes. There is no search and no index: Vortex is a transport, not a source. Optional SOCKS5 proxy support routes every connection through your VPN provider's endpoint and switches off everything that cannot be proxied.
 
+The full behaviour of every feature as built, with its rules and known gaps, is in [docs/FEATURES.md](docs/FEATURES.md).
+
 ## Stack
 
 Tauri 2 + Rust (scanning, playback tracking, file watching, SQLite) · Vue 3 + TypeScript · Tailwind v4 + shadcn-vue · SQLite via rusqlite.

@@ -167,7 +167,7 @@ export async function previewInvoke(cmd: string, args?: Record<string, unknown>)
     case "get_settings": return {};
     case "list_categories": return ["Movies", "TV", "Anime"];
     case "search": return { items: items.filter((m) => m.title.toLowerCase().includes(String(args?.query ?? "").toLowerCase())), episodes: [] };
-    case "list_libraries": return [{ id: 1, path: "D:\\Media", name: "Media", available: true }];
+    case "list_libraries": return [{ id: 1, path: "D:\\Media", name: "Media", available: true, file_count: 212 }];
     case "tmdb_store": return { titles: 16, details: 16, images: 30, image_bytes: 48_000_000 };
     case "get_tmdb_status": return "••••••••a1b2";
     case "detect_players": case "list_drives": case "list_history": case "pending_open_urls": case "default_ignored_dirs": case "torrent_list": return [];

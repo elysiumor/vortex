@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { Toaster, toast } from "vue-sonner";
-import { History, Copy, BarChart3, Settings, Search, Sparkles, X, Play, Trash2, ChevronDown, Sun, Moon } from "@lucide/vue";
-import { api, type SmartList } from "./lib/api";
+import { History, Copy, BarChart3, Settings, Search, Sparkles, X, Play, Trash2, ChevronDown, Sun, Moon, RefreshCw, Loader2, Clapperboard } from "@lucide/vue";
+import { api, type JobProgress, type SmartList } from "./lib/api";
 import { hms } from "./lib/format";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -19,9 +19,10 @@ import DuplicatesView from "./components/DuplicatesView.vue";
 import CollectionsView from "./components/CollectionsView.vue";
 import StatsView from "./components/StatsView.vue";
 import DownloadsView from "./components/DownloadsView.vue";
+import TmdbView from "./components/TmdbView.vue";
 import QuickSearch from "./components/QuickSearch.vue";
 
-type Page = "home" | "movies" | "series" | "collections" | "history" | "duplicates" | "stats" | "downloads" | "settings" | "smart";
+type Page = "home" | "movies" | "series" | "collections" | "history" | "duplicates" | "stats" | "downloads" | "tmdb" | "settings" | "smart";
 const page = ref<Page>("home");
 const openId = ref<number | null>(null);
 const cameFrom = ref<Page>("home");
@@ -51,6 +52,7 @@ const more = computed(() => [
   { id: "history" as Page, label: "History", icon: History },
   { id: "stats" as Page, label: "Statistics", icon: BarChart3 },
   { id: "duplicates" as Page, label: "Duplicates", icon: Copy, count: dupCount.value },
+  { id: "tmdb" as Page, label: "TMDb", icon: Clapperboard },
 ]);
 const inMore = computed(() => !openId.value && !search.value && (more.value.some((m) => m.id === page.value) || page.value === "smart"));
 
@@ -62,18 +64,60 @@ const heroPage = computed(() => !search.value.trim() && (openId.value !== null |
 function onScroll() { scrolled.value = (scroller.value?.scrollTop ?? 0) > 24; }
 watch([page, openId, activeSmart], () => { scroller.value?.scrollTo({ top: 0 }); scrolled.value = false; });
 
-// ---- Ctrl+K palette ----
-const quickOpen = ref(false);
-async function rescanFromPalette() {
-  toast("Rescanning libraries…");
+// ---- background work: the status pill and the Sync button ----
+// One entry per job while it runs; the backend's last event for a job has
+// `running` false and drops it here.
+const jobs = ref<Partial<Record<JobProgress["job"], JobProgress>>>({});
+// Shown in the order a person would want to know about them: a rename
+// touching their files before a poster fetch that can run for an hour.
+const JOB_ORDER: JobProgress["job"][] = ["rename", "scan", "memory", "posters", "durations"];
+const activeJob = computed(() => JOB_ORDER.map((j) => jobs.value[j]).find((j) => j?.running) ?? null);
+const otherJobs = computed(() => JOB_ORDER.map((j) => jobs.value[j]).filter((j) => j?.running && j !== activeJob.value) as JobProgress[]);
+const jobPct = computed(() => {
+  const j = activeJob.value;
+  return j && j.total > 0 ? Math.min(100, Math.round((100 * j.done) / j.total)) : 0;
+});
+const jobTitle = computed(() => {
+  const j = activeJob.value;
+  if (!j) return "";
+  const where = j.detail ? ` · ${j.detail}` : "";
+  const count = j.total > 0 ? ` · ${j.done} / ${j.total}` : "";
+  return `${j.label}${where}${count}`;
+});
+function onJob(p: JobProgress) {
+  const next = { ...jobs.value };
+  if (p.running) next[p.job] = p; else delete next[p.job];
+  jobs.value = next;
+}
+
+const syncing = ref(false);
+/** Rescan every library, then refresh what is on screen. */
+async function syncLibrary() {
+  if (syncing.value) return;
+  if (jobs.value.scan?.running) {
+    toast("Already syncing; the library refreshes when it finishes.");
+    return;
+  }
+  syncing.value = true;
   try {
     const s = await api.scanLibraries();
-    toast.success(`Scan done: ${s.files_seen} files, ${s.added} added, ${s.removed} removed`);
+    const parts = [`${s.files_seen} files`];
+    if (s.added) parts.push(`${s.added} added`);
+    if (s.renamed) parts.push(`${s.renamed} renamed`);
+    if (s.removed) parts.push(`${s.removed} removed`);
+    if (s.libraries_skipped.length) parts.push(`${s.libraries_skipped.length} offline`);
+    toast.success(`Synced: ${parts.join(", ")}`);
   } catch (e) {
     toast.error(String(e));
+  } finally {
+    syncing.value = false;
   }
   refreshAll();
 }
+
+// ---- Ctrl+K palette ----
+const quickOpen = ref(false);
+const rescanFromPalette = syncLibrary;
 
 const dark = ref(document.documentElement.classList.contains("dark"));
 function toggleTheme() {
@@ -237,6 +281,7 @@ onMounted(async () => {
     }
     refreshAll();
   }));
+  unlisteners.push(await api.onJobProgress(onJob));
   unlisteners.push(await api.onLibraryRestored(() => { openId.value = null; refreshAll(); }));
   unlisteners.push(await api.onLibraryChanged(() => refreshAll()));
   unlisteners.push(await api.onDurationsDone((p) => { if (p.found > 0) refreshAll(); }));
@@ -318,6 +363,19 @@ onUnmounted(() => {
             <button class="absolute right-2 top-1/2 -translate-y-1/2 rounded-md border border-foreground/10 px-1.5 text-[10px] text-foreground/45 hover:text-foreground" title="Quick search" @click="quickOpen = true">Ctrl K</button>
           </div>
           <div class="flex items-center gap-1">
+            <!-- What is going on behind the scenes, while anything is. -->
+            <div v-if="activeJob" class="glass relative mr-1 hidden min-w-0 max-w-[340px] items-center gap-2 overflow-hidden rounded-full border border-foreground/10 py-1.5 pl-3 pr-1.5 text-xs lg:flex"
+                 :title="[jobTitle, ...otherJobs.map((j) => j.label)].join('\n')">
+              <Loader2 class="size-3.5 shrink-0 animate-spin text-primary" />
+              <span class="min-w-0 truncate"><span class="font-semibold">{{ activeJob.label }}</span><span v-if="activeJob.detail" class="text-foreground/60"> · {{ activeJob.detail }}</span></span>
+              <span class="shrink-0 tabular-nums font-semibold" v-if="activeJob.total > 0">{{ jobPct }}%</span>
+              <span class="shrink-0 text-foreground/60" v-if="otherJobs.length">+{{ otherJobs.length }}</span>
+              <button v-if="activeJob.job === 'posters'" class="grid size-5 shrink-0 place-items-center rounded-full hover:bg-destructive hover:text-white" title="Stop fetching posters" @click="api.cancelPosters()"><X class="size-3" /></button>
+              <div class="absolute inset-x-0 bottom-0 h-[2px] bg-foreground/10"><div class="bg-brand h-full transition-[width] duration-300" :class="{ 'animate-pulse': activeJob.total === 0 }" :style="{ width: (activeJob.total > 0 ? jobPct : 100) + '%' }"></div></div>
+            </div>
+            <Button variant="ghost" size="icon" class="rounded-full" :title="activeJob ? jobTitle : 'Sync library: rescan folders and refresh'" @click="syncLibrary">
+              <RefreshCw :class="{ 'animate-spin': syncing || activeJob }" />
+            </Button>
             <Button variant="ghost" size="icon" class="rounded-full" :title="dark ? 'Light mode' : 'Dark mode'" @click="toggleTheme">
               <Sun v-if="dark" /><Moon v-else />
             </Button>
@@ -330,7 +388,7 @@ onUnmounted(() => {
 
       <main ref="scroller" class="flex-1 overflow-y-auto overflow-x-hidden" @scroll.passive="onScroll">
         <SearchView v-if="search.trim()" class="mx-auto max-w-[1700px] px-10 pb-12 pt-24" :query="search" @open="openItem" />
-        <SeriesView v-else-if="openId !== null" ref="detail" :id="openId" @back="back" />
+        <SeriesView v-else-if="openId !== null" ref="detail" :id="openId" @back="back" @replaced="(id) => (openId = id)" />
         <HomeView v-else-if="page === 'home'" ref="home" @open="openItem" @go="go" />
         <div v-else class="mx-auto max-w-[1700px] px-10 pb-12 pt-24">
           <LibraryView v-if="page === 'movies'" ref="library" kind="movie" @open="openItem" @save-smart="addSmartList" />
@@ -341,7 +399,8 @@ onUnmounted(() => {
           <StatsView v-else-if="page === 'stats'" ref="statsRef" @open="openItem" />
           <DuplicatesView v-else-if="page === 'duplicates'" ref="duplicates" @open="openItem" />
           <DownloadsView v-else-if="page === 'downloads'" ref="downloadsRef" @go="go" />
-          <SettingsView v-else @scanned="onScanned" />
+          <TmdbView v-else-if="page === 'tmdb'" @open="openItem" @changed="refreshAll" />
+          <SettingsView v-else @scanned="onScanned" @go="go" />
         </div>
       </main>
 

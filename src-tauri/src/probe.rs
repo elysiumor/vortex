@@ -163,6 +163,7 @@ fn probe_pass(app: &AppHandle) {
     let mut found = 0;
     for (i, (id, path)) in items.iter().enumerate() {
         let p = Path::new(path);
+        crate::jobs::report(app, "durations", "Reading durations", i, total, p.file_name().map(|n| n.to_string_lossy().to_string()));
         if !p.exists() {
             continue;
         }
@@ -186,5 +187,6 @@ fn probe_pass(app: &AppHandle) {
         }
     }
     tracing::info!(files = total, found, ms = started.elapsed().as_millis() as u64, "duration check finished");
+    crate::jobs::finished(app, "durations");
     let _ = app.emit("durations-done", Progress { done: total, total, found });
 }

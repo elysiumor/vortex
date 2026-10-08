@@ -682,8 +682,10 @@ pub fn apply(app: &AppHandle, ids: Vec<i64>) -> Result<Report, String> {
     jobs::exclusive(app, || {
         let mut report = Report::default();
         let mut batch: Vec<Move> = Vec::new();
-        for id in ids {
+        let total = ids.len();
+        for (i, id) in ids.into_iter().enumerate() {
             let plan = plan_item(app, id);
+            jobs::report(app, "rename", "Renaming files", i, total, Some(plan.title.clone()));
             if let Some(why) = plan.skipped {
                 report.failed.push((plan.title, why));
                 continue;
@@ -711,6 +713,7 @@ pub fn apply(app: &AppHandle, ids: Vec<i64>) -> Result<Report, String> {
             history.batches.drain(..excess);
             save_history(app, &history)?;
         }
+        jobs::finished(app, "rename");
         Ok(report)
     })
 }

@@ -3,11 +3,11 @@ use crate::AppState;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 
 const API: &str = "https://api.themoviedb.org/3";
-const IMG: &str = "https://image.tmdb.org/t/p/w342";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TmdbMatch {
@@ -43,9 +43,97 @@ struct SearchResult {
     genre_ids: Vec<i64>,
 }
 
-/// Pinned so genre names, overviews and episode titles are always English
-/// regardless of TMDB's locale guess.
-const LANG: &str = "en-US";
+/// Every option TMDb's API offers for the calls Vortex makes, as the user
+/// set them on the TMDb page (`tmdb_*` settings), with the app's defaults
+/// where they have not. Read once into memory; `load_prefs` refreshes it
+/// whenever a `tmdb_*` setting changes.
+#[derive(Clone, Debug)]
+pub struct Prefs {
+    /// `language` on every call: titles, overviews, genres, episode names.
+    pub language: String,
+    /// `region` on movie searches: which country's release dates the year
+    /// filter and dates refer to. Empty: TMDb's default.
+    pub region: String,
+    /// Movie search year filter: `primary_release_year` (the original
+    /// release) rather than `year` (any release anywhere).
+    pub primary_year: bool,
+    /// Country whose certification (PG-13, 18) is shown; others as fallback.
+    pub cert_country: String,
+    /// Image sizes from TMDb's configuration: posters, backdrops, episode
+    /// stills, cast photos.
+    pub poster_size: String,
+    pub backdrop_size: String,
+    pub still_size: String,
+    pub profile_size: String,
+    /// Pause between calls in a long run, and how long one call may take.
+    pub delay_ms: u64,
+    pub timeout_secs: u64,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Prefs {
+            language: "en-US".into(),
+            region: String::new(),
+            primary_year: false,
+            cert_country: "US".into(),
+            poster_size: "w342".into(),
+            backdrop_size: "w1280".into(),
+            still_size: "w300".into(),
+            profile_size: "w185".into(),
+            delay_ms: 120,
+            timeout_secs: 20,
+        }
+    }
+}
+
+static PREFS: Mutex<Option<Prefs>> = Mutex::new(None);
+
+pub fn prefs() -> Prefs {
+    PREFS.lock().ok().and_then(|g| g.clone()).unwrap_or_default()
+}
+
+/// Read the `tmdb_*` settings. Blank or unparsable values keep the default.
+pub fn load_prefs(conn: &rusqlite::Connection) {
+    let d = Prefs::default();
+    let get = |k: &str| db::get_setting(conn, k).ok().flatten().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let text = |k: &str, default: &str| get(k).unwrap_or_else(|| default.to_string());
+    let num = |k: &str, default: u64| get(k).and_then(|v| v.parse().ok()).unwrap_or(default);
+    let p = Prefs {
+        language: text("tmdb_language", &d.language),
+        region: get("tmdb_region").map(|r| r.to_uppercase()).unwrap_or_default(),
+        primary_year: get("tmdb_year_mode").as_deref() == Some("primary"),
+        cert_country: text("tmdb_cert_country", &d.cert_country).to_uppercase(),
+        poster_size: text("tmdb_poster_size", &d.poster_size),
+        backdrop_size: text("tmdb_backdrop_size", &d.backdrop_size),
+        still_size: text("tmdb_still_size", &d.still_size),
+        profile_size: text("tmdb_profile_size", &d.profile_size),
+        delay_ms: num("tmdb_delay_ms", d.delay_ms).min(10_000),
+        timeout_secs: num("tmdb_timeout_secs", d.timeout_secs).clamp(5, 120),
+    };
+    let language_changed = prefs().language != p.language;
+    if let Ok(mut g) = PREFS.lock() {
+        *g = Some(p);
+    }
+    // Genre names were fetched in the old language.
+    if language_changed {
+        if let Some(c) = GENRE_CACHE.get() {
+            if let Ok(mut m) = c.lock() {
+                m.clear();
+            }
+        }
+    }
+}
+
+fn lang() -> String {
+    prefs().language
+}
+
+/// A TMDb image URL at one of the sizes from the configuration endpoint
+/// ("w342", "original").
+fn image_url(size: &str, path: &str) -> String {
+    format!("https://image.tmdb.org/t/p/{size}{path}")
+}
 
 static GENRE_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::collections::HashMap<i64, String>>>> =
     std::sync::OnceLock::new();
@@ -72,7 +160,7 @@ fn genre_names(key: &str, kind: &str, ids: &[i64]) -> Option<String> {
     struct GL {
         genres: Vec<G>,
     }
-    let req = client().get(format!("{API}/genre/{kind_key}/list")).query(&[("language", LANG)]);
+    let req = client().get(format!("{API}/genre/{kind_key}/list")).query(&[("language", lang().as_str())]);
     let list: GL = auth(req, key).send().ok()?.json().ok()?;
     let m: std::collections::HashMap<i64, String> = list.genres.into_iter().map(|g| (g.id, g.name)).collect();
     let out = join_genres(&m, ids);
@@ -87,7 +175,7 @@ fn join_genres(m: &std::collections::HashMap<i64, String>, ids: &[i64]) -> Optio
 
 fn client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(prefs().timeout_secs))
         .user_agent("vortex-media-manager")
         .build()
         .expect("http client")
@@ -102,12 +190,23 @@ fn auth(req: reqwest::blocking::RequestBuilder, key: &str) -> reqwest::blocking:
     }
 }
 
-pub fn search(key: &str, kind: &str, query: &str, year: Option<i32>) -> Result<Vec<TmdbMatch>, String> {
+/// `include_adult`: TMDb hides titles it flags as adult unless asked
+/// ("Monella" never came back for "Frivolous Lola"). A search the user runs
+/// by hand asks; automatic matching only with the setting on.
+pub fn search(key: &str, kind: &str, query: &str, year: Option<i32>, include_adult: bool) -> Result<Vec<TmdbMatch>, String> {
+    let p = prefs();
     let endpoint = if kind == "movie" { "search/movie" } else { "search/tv" };
-    let year_param = if kind == "movie" { "year" } else { "first_air_date_year" };
+    let year_param = match (kind, p.primary_year) {
+        ("movie", true) => "primary_release_year",
+        ("movie", false) => "year",
+        _ => "first_air_date_year",
+    };
     let mut req = client()
         .get(format!("{API}/{endpoint}"))
-        .query(&[("query", query), ("include_adult", "false"), ("language", LANG)]);
+        .query(&[("query", query), ("include_adult", if include_adult { "true" } else { "false" }), ("language", p.language.as_str())]);
+    if kind == "movie" && !p.region.is_empty() {
+        req = req.query(&[("region", p.region.as_str())]);
+    }
     if let Some(y) = year {
         req = req.query(&[(year_param, y.to_string())]);
     }
@@ -130,7 +229,7 @@ pub fn search(key: &str, kind: &str, query: &str, year: Option<i32>) -> Result<V
                 title: r.title.or(r.name).unwrap_or_default(),
                 year: date.get(..4).and_then(|y| y.parse().ok()),
                 overview: r.overview.filter(|o| !o.is_empty()),
-                poster_url: r.poster_path.as_ref().map(|p| format!("{IMG}{p}")),
+                poster_url: r.poster_path.as_ref().map(|p| image_url(&prefs().poster_size, p)),
                 poster: r.poster_path,
                 rating: r.vote_average.filter(|v| *v > 0.0).map(|v| (v * 10.0).round() / 10.0),
                 genre_ids: r.genre_ids,
@@ -140,13 +239,15 @@ pub fn search(key: &str, kind: &str, query: &str, year: Option<i32>) -> Result<V
 }
 
 /// Search with the year first; if nothing comes back, retry without it.
-fn best_match(key: &str, item: &MediaItem) -> Result<Option<TmdbMatch>, String> {
-    let with_year = search(key, &item.kind, &item.title, item.year)?;
+/// `year_fallback`: when nothing matches the file's year, search again
+/// without it (a wrong year in a file name is common; so is a remake).
+fn best_match(key: &str, item: &MediaItem, adult: bool, year_fallback: bool) -> Result<Option<TmdbMatch>, String> {
+    let with_year = search(key, &item.kind, &item.title, item.year, adult)?;
     if let Some(m) = with_year.into_iter().next() {
         return Ok(Some(m));
     }
-    if item.year.is_some() {
-        return Ok(search(key, &item.kind, &item.title, None)?.into_iter().next());
+    if item.year.is_some() && year_fallback {
+        return Ok(search(key, &item.kind, &item.title, None, adult)?.into_iter().next());
     }
     Ok(None)
 }
@@ -191,7 +292,7 @@ fn season_episodes(app: &AppHandle, key: &str, tmdb_id: i64, season: i32, need: 
             None => Err("Add your TMDB API key in Settings first".into()),
         };
     }
-    let req = client().get(format!("{API}/tv/{tmdb_id}/season/{season}")).query(&[("language", LANG)]);
+    let req = client().get(format!("{API}/tv/{tmdb_id}/season/{season}")).query(&[("language", lang().as_str())]);
     let resp = auth(req, key).send().map_err(|e| format!("TMDB request failed: {e}"))?;
     if resp.status().as_u16() == 404 {
         return Ok(None); // season numbering differs from TMDB
@@ -204,7 +305,7 @@ fn season_episodes(app: &AppHandle, key: &str, tmdb_id: i64, season: i32, need: 
     if let Ok(conn) = state.db.lock() {
         let _ = db::set_season_json(&conn, tmdb_id, season, &json);
     }
-    std::thread::sleep(Duration::from_millis(100)); // stay well under TMDB's rate limit
+    std::thread::sleep(Duration::from_millis(prefs().delay_ms)); // stay under TMDb's rate limit
     Ok(Some(body.episodes))
 }
 
@@ -260,7 +361,7 @@ pub fn fetch_episode_titles(app: &AppHandle, media_item_id: i64, force: bool) ->
                 ep.name.as_deref().filter(|s| !s.is_empty()),
                 ep.overview.as_deref().filter(|s| !s.is_empty()),
                 ep.air_date.as_deref().filter(|s| !s.is_empty()),
-                ep.still_path.as_deref().map(|p| format!("https://image.tmdb.org/t/p/w300{p}")).as_deref(),
+                ep.still_path.as_deref().map(|p| image_url(&prefs().still_size, p)).as_deref(),
                 ep.vote_average.filter(|v| *v > 0.0),
             )
             .map_err(|e| e.to_string())?;
@@ -469,7 +570,7 @@ fn certification(kind: &str, raw: &RawDetails) -> Option<String> {
         }
     };
     list.iter()
-        .find(|c| c.iso_3166_1.as_deref() == Some("US"))
+        .find(|c| c.iso_3166_1.as_deref() == Some(prefs().cert_country.as_str()))
         .and_then(pick)
         .or_else(|| list.iter().find_map(pick))
 }
@@ -485,7 +586,7 @@ fn normalize(kind: &str, raw: RawDetails, backdrop_local: Option<String>, fetche
             Some(CastMember {
                 name: non_empty(c.name)?,
                 character: non_empty(c.character),
-                photo_url: c.profile_path.map(|p| format!("https://image.tmdb.org/t/p/w185{p}")),
+                photo_url: c.profile_path.map(|p| image_url(&prefs().profile_size, &p)),
             })
         })
         .collect();
@@ -515,7 +616,7 @@ fn normalize(kind: &str, raw: RawDetails, backdrop_local: Option<String>, fetche
             episode_count: s.episode_count.unwrap_or(0),
             air_date: non_empty(s.air_date),
             overview: non_empty(s.overview),
-            poster_url: s.poster_path.map(|p| format!("https://image.tmdb.org/t/p/w185{p}")),
+            poster_url: s.poster_path.map(|p| image_url(&prefs().poster_size, &p)),
         })
         .collect();
     Details {
@@ -570,7 +671,7 @@ fn backdrop_file(app: &AppHandle, kind: &str, tmdb_id: i64, raw_path: Option<&st
     }
     let p = raw_path?;
     let bytes = client()
-        .get(format!("https://image.tmdb.org/t/p/w1280{p}"))
+        .get(image_url(&prefs().backdrop_size, p))
         .send()
         .ok()?
         .error_for_status()
@@ -582,20 +683,25 @@ fn backdrop_file(app: &AppHandle, kind: &str, tmdb_id: i64, raw_path: Option<&st
 }
 
 /// How long cached details are served before they are fetched again on
-/// their own. Refresh on the title page always fetches.
+/// their own, unless the `tmdb_cache_days` setting says otherwise (0 keeps
+/// them for ever). Refresh on the title page always fetches.
 const DETAILS_MAX_AGE_DAYS: i64 = 90;
 
 /// Full details for the detail page. Served from the local cache unless
 /// `refresh` is set or the cache is older than `DETAILS_MAX_AGE_DAYS`.
 pub fn get_details(app: &AppHandle, media_item_id: i64, refresh: bool) -> Result<Option<Details>, String> {
     let state = app.state::<AppState>();
-    let (key, kind, tmdb_id, cached) = {
+    let (key, kind, tmdb_id, cached, max_age) = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
         let item = db::get_media_item(&conn, media_item_id).map_err(|e| e.to_string())?.ok_or("item not found")?;
         let Some(tmdb_id) = item.tmdb_id else { return Ok(None) };
         let key = db::get_setting(&conn, "tmdb_key").map_err(|e| e.to_string())?.unwrap_or_default();
         let cached = db::get_details_json(&conn, &item.kind, tmdb_id).map_err(|e| e.to_string())?;
-        (key, item.kind, tmdb_id, cached)
+        let max_age = db::get_setting(&conn, "tmdb_cache_days")
+            .map_err(|e| e.to_string())?
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(DETAILS_MAX_AGE_DAYS);
+        (key, item.kind, tmdb_id, cached, max_age)
     };
 
     let stale = |fetched_at: &str| -> bool {
@@ -608,7 +714,7 @@ pub fn get_details(app: &AppHandle, media_item_id: i64, refresh: bool) -> Result
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let today = chrono_free_date(now);
         match (days(fetched_at), days(&today)) {
-            (Some(a), Some(b)) => b - a > DETAILS_MAX_AGE_DAYS,
+            (Some(a), Some(b)) => max_age > 0 && b - a > max_age,
             _ => true,
         }
     };
@@ -635,7 +741,7 @@ pub fn get_details(app: &AppHandle, media_item_id: i64, refresh: bool) -> Result
     } else {
         (format!("tv/{tmdb_id}"), "credits,videos,external_ids,content_ratings")
     };
-    let req = client().get(format!("{API}/{path}")).query(&[("append_to_response", append), ("language", LANG)]);
+    let req = client().get(format!("{API}/{path}")).query(&[("append_to_response", append), ("language", lang().as_str())]);
     let resp = auth(req, &key).send().map_err(|e| format!("TMDB request failed: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("TMDB returned HTTP {}", resp.status()));
@@ -689,7 +795,7 @@ pub fn posters_dir(app: &AppHandle) -> Result<PathBuf, String> {
 
 fn download_poster(poster: &str, dest: &Path) -> Result<(), String> {
     let bytes = client()
-        .get(format!("{IMG}{poster}"))
+        .get(image_url(&prefs().poster_size, poster))
         .send()
         .map_err(|e| e.to_string())?
         .error_for_status()
@@ -794,7 +900,7 @@ fn details_to_item(conn: &rusqlite::Connection, media_item_id: i64, raw: &RawDet
     db::set_item_genres(conn, media_item_id, (!genres.is_empty()).then(|| genres.join(", ")).as_deref())?;
     if let Some(c) = &raw.belongs_to_collection {
         if let (Some(cid), Some(name)) = (c.id, c.name.clone()) {
-            let url = c.poster_path.as_ref().map(|p| format!("{IMG}{p}"));
+            let url = c.poster_path.as_ref().map(|p| image_url(&prefs().poster_size, p));
             let _ = db::attach_tmdb_collection(conn, media_item_id, cid, &name, url.as_deref());
         }
     }
@@ -831,7 +937,9 @@ pub fn apply_remembered(app: &AppHandle) -> usize {
         rows.map(|it| it.flatten().collect()).unwrap_or_default()
     };
     let (mut reused, mut known_missing) = (0, 0);
-    for (id, kind, sort_key, year) in candidates {
+    let total = candidates.len();
+    for (i, (id, kind, sort_key, year)) in candidates.into_iter().enumerate() {
+        crate::jobs::report(app, "memory", "Restoring TMDb data", i, total, None);
         let mem = match state.db.lock() {
             Ok(conn) => db::remembered(&conn, &kind, &sort_key).ok().flatten(),
             Err(_) => None,
@@ -873,6 +981,9 @@ pub fn apply_remembered(app: &AppHandle) -> usize {
             let _ = fetch_episode_titles(app, id, false);
         }
         reused += 1;
+    }
+    if total > 0 {
+        crate::jobs::finished(app, "memory");
     }
     if reused + known_missing > 0 {
         tracing::info!(reused, known_missing, "TMDb data reused from earlier, no API calls");
@@ -947,6 +1058,17 @@ struct Progress {
 /// was running; the next pass honours it.
 static FORCE_NEXT: AtomicBool = AtomicBool::new(false);
 
+/// Set by the Stop button; the running pass ends at the next title and no
+/// pass queued meanwhile runs. Titles not reached stay unchecked, so the
+/// next fetch picks them up.
+static CANCEL: AtomicBool = AtomicBool::new(false);
+
+pub fn cancel_fetch(app: &AppHandle) {
+    if app.state::<AppState>().fetch_job.is_running() {
+        CANCEL.store(true, Ordering::SeqCst);
+    }
+}
+
 /// Background job: find posters for every item that has none.
 /// `force` also retries items that were checked before and found nothing.
 /// Asking while it runs is not an error; the running job makes one more pass,
@@ -967,31 +1089,40 @@ pub fn fetch_missing(app: AppHandle, force: bool) -> Result<(), String> {
         tracing::debug!(force, "poster fetch already running; it will make one more pass");
         return Ok(());
     }
+    CANCEL.store(false, Ordering::SeqCst);
     std::thread::spawn(move || {
         let state = app.state::<AppState>();
         let _release = state.fetch_job.release_on_panic();
         loop {
-            fetch_pass(&app, FORCE_NEXT.swap(false, Ordering::SeqCst));
+            let completed = fetch_pass(&app, FORCE_NEXT.swap(false, Ordering::SeqCst));
+            if !completed {
+                state.fetch_job.release();
+                break;
+            }
             if !state.fetch_job.another_pass() {
                 break;
             }
         }
+        crate::jobs::finished(&app, "posters");
     });
     Ok(())
 }
 
-fn fetch_pass(app: &AppHandle, force: bool) {
+/// One pass over the titles missing a poster. False when stopped by the user.
+fn fetch_pass(app: &AppHandle, force: bool) -> bool {
     let state = app.state::<AppState>();
     let loaded = state.db.lock().map_err(|e| e.to_string()).and_then(|conn| {
         let key = db::get_setting(&conn, "tmdb_key").map_err(|e| e.to_string())?.unwrap_or_default();
-        Ok((key, db::items_missing_poster(&conn, force).map_err(|e| e.to_string())?))
+        let adult = db::get_setting(&conn, "tmdb_adult").map_err(|e| e.to_string())?.as_deref() == Some("1");
+        let year_fallback = db::get_setting(&conn, "tmdb_year_fallback").map_err(|e| e.to_string())?.as_deref() != Some("0");
+        Ok((key, adult, year_fallback, db::items_missing_poster(&conn, force).map_err(|e| e.to_string())?))
     });
-    let (key, items) = match loaded {
+    let (key, adult, year_fallback, items) = match loaded {
         Ok(v) => v,
         Err(e) => {
             tracing::error!("poster fetch could not read the library: {e}");
             let _ = app.emit("posters-done", Progress { done: 0, total: 0, matched: 0, current: e });
-            return;
+            return true;
         }
     };
     let total = items.len();
@@ -999,7 +1130,13 @@ fn fetch_pass(app: &AppHandle, force: bool) {
     tracing::info!(titles = total, force, "poster fetch starting");
     let started = std::time::Instant::now();
     for (i, item) in items.iter().enumerate() {
+        if CANCEL.swap(false, Ordering::SeqCst) {
+            tracing::info!(done = i, of = total, matched, "poster fetch stopped by the user");
+            let _ = app.emit("posters-done", Progress { done: i, total, matched, current: "stopped by you".into() });
+            return false;
+        }
         let _ = app.emit("posters-progress", Progress { done: i, total, matched, current: item.title.clone() });
+        crate::jobs::report(app, "posters", "Fetching posters", i, total, Some(item.title.clone()));
         // Already matched, only the picture is missing (its download failed):
         // fetch that picture again. Searching anew could replace a match the
         // user picked by hand with the top search result.
@@ -1009,7 +1146,7 @@ fn fetch_pass(app: &AppHandle, force: bool) {
             }
             continue;
         }
-        match best_match(&key, item) {
+        match best_match(&key, item, adult, year_fallback) {
             Ok(Some(m)) => match apply_match(app, item.id, &m, false) {
                 Ok(()) => {
                     tracing::debug!(title = %item.title, tmdb_id = m.tmdb_id, "matched");
@@ -1029,11 +1166,12 @@ fn fetch_pass(app: &AppHandle, force: bool) {
                 // Auth or network failure: stop the whole run rather than hammer the API.
                 tracing::warn!(at = %item.title, done = i, of = total, matched, "poster fetch stopped: {e}");
                 let _ = app.emit("posters-done", Progress { done: i, total, matched, current: e });
-                return;
+                return true;
             }
         }
-        std::thread::sleep(Duration::from_millis(120)); // stay well under TMDB's rate limit
+        std::thread::sleep(Duration::from_millis(prefs().delay_ms)); // stay under TMDb's rate limit
     }
     tracing::info!(titles = total, matched, ms = started.elapsed().as_millis() as u64, "poster fetch finished");
     let _ = app.emit("posters-done", Progress { done: total, total, matched, current: String::new() });
+    true
 }

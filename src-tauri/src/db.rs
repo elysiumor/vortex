@@ -176,6 +176,8 @@ pub struct Library {
     pub path: String,
     pub name: String,
     pub available: bool,
+    /// Video files filed under this library, for the removal prompt.
+    pub file_count: i64,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -295,11 +297,20 @@ FROM episodes e LEFT JOIN watch_progress w ON w.episode_id = e.id
 /// or disconnected drive; callers fill it in via `fill_availability` after
 /// releasing the database lock.
 pub fn list_libraries_rows(conn: &Connection) -> rusqlite::Result<Vec<Library>> {
-    let mut stmt = conn.prepare("SELECT id, path, name FROM libraries ORDER BY name")?;
+    let mut stmt = conn.prepare(
+        "SELECT l.id, l.path, l.name, (SELECT COUNT(*) FROM episodes e WHERE e.library_id = l.id)
+         FROM libraries l ORDER BY l.name",
+    )?;
     let rows = stmt.query_map([], |r| {
-        Ok(Library { id: r.get(0)?, available: false, path: r.get(1)?, name: r.get(2)? })
+        Ok(Library { id: r.get(0)?, available: false, path: r.get(1)?, name: r.get(2)?, file_count: r.get(3)? })
     })?;
     rows.collect()
+}
+
+/// The title a file is filed under, for a page whose title was replaced
+/// by a rescan (an external rename gave the file a new title).
+pub fn item_for_path(conn: &Connection, path: &str) -> rusqlite::Result<Option<i64>> {
+    conn.query_row("SELECT media_item_id FROM episodes WHERE path = ?1", [path], |r| r.get(0)).optional()
 }
 
 /// Probe each path. Must not run while the database lock is held.
@@ -328,7 +339,7 @@ pub fn add_library(conn: &Connection, path: &str) -> rusqlite::Result<Library> {
         params![path, name],
     )?;
     let id: i64 = conn.query_row("SELECT id FROM libraries WHERE path = ?1", [path], |r| r.get(0))?;
-    Ok(Library { id, path: path.to_string(), name, available: Path::new(path).is_dir() })
+    Ok(Library { id, path: path.to_string(), name, available: Path::new(path).is_dir(), file_count: 0 })
 }
 
 /// Folder comparison key: case-insensitive, one separator style, no trailing separator.

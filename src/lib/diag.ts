@@ -79,6 +79,12 @@ export function installDiagnostics() {
   window.addEventListener("unhandledrejection", (e) => {
     send("error", `unhandled rejection: ${e.reason}`);
   });
+  // The Content Security Policy only reports to the devtools console, which
+  // the installed build has no way to show; a blocked image or request would
+  // otherwise look like a silent failure.
+  window.addEventListener("securitypolicyviolation", (e) => {
+    send("error", `CSP blocked ${e.violatedDirective}: ${e.blockedURI || "inline"} at ${e.sourceFile || "?"}:${e.lineNumber}`);
+  });
 
   // A long task is the renderer being unable to paint. This is what "stuck
   // while scrolling" looks like from the inside.

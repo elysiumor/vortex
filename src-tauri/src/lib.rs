@@ -80,6 +80,7 @@ pub fn run() {
                     db::set_setting(&conn, "player_path", &p.path)?;
                 }
             }
+            tmdb::load_prefs(&conn);
             app.manage(AppState {
                 db: Mutex::new(conn),
                 db_path,
@@ -127,6 +128,7 @@ pub fn run() {
             commands::scan_libraries,
             commands::list_media,
             commands::get_media_item,
+            commands::item_for_paths,
             commands::list_categories,
             commands::set_item_category,
             commands::list_episodes,
@@ -148,6 +150,7 @@ pub fn run() {
             commands::rename_undo,
             commands::rename_can_undo,
             commands::fetch_posters,
+            commands::cancel_posters,
             commands::search_tmdb,
             commands::apply_tmdb_match,
             commands::test_tmdb_key,

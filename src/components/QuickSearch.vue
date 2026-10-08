@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch } from "vue";
-import { Film, Tv, Home, Layers, Download, History, BarChart3, Copy, Settings, SunMoon, RefreshCw, Search } from "@lucide/vue";
+import { Film, Tv, Home, Layers, Download, History, BarChart3, Copy, Settings, SunMoon, RefreshCw, Search, Clapperboard } from "@lucide/vue";
 import { api, posterSrc, type MediaItem } from "../lib/api";
 import { CommandDialog, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList, CommandSeparator } from "@/components/ui/command";
 
@@ -8,7 +8,7 @@ import { CommandDialog, CommandEmpty, CommandGroup, CommandInput, CommandItem, C
  * Ctrl+K: jump to any title by name, go to a page, or run an action,
  * without leaving the keyboard.
  */
-type Page = "home" | "movies" | "series" | "collections" | "downloads" | "history" | "stats" | "duplicates" | "settings";
+type Page = "home" | "movies" | "series" | "collections" | "downloads" | "history" | "stats" | "duplicates" | "tmdb" | "settings";
 const open = defineModel<boolean>("open", { required: true });
 const emit = defineEmits<{ openItem: [id: number]; go: [page: Page]; toggleTheme: []; rescan: []; search: [query: string] }>();
 
@@ -29,6 +29,7 @@ const pages: { id: Page; label: string; icon: typeof Home }[] = [
   { id: "history", label: "History", icon: History },
   { id: "stats", label: "Statistics", icon: BarChart3 },
   { id: "duplicates", label: "Duplicates", icon: Copy },
+  { id: "tmdb", label: "TMDb", icon: Clapperboard },
   { id: "settings", label: "Settings", icon: Settings },
 ];
 

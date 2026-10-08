@@ -18,7 +18,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 
 const props = defineProps<{ id: number }>();
-const emit = defineEmits<{ back: [] }>();
+const emit = defineEmits<{ back: []; replaced: [id: number] }>();
 
 const item = ref<MediaItem | null>(null);
 const episodes = ref<Episode[]>([]);
@@ -29,8 +29,35 @@ const editValue = ref("");
 const openDetails = ref<number | null>(null);
 const showAllCast = ref(false);
 
+// Each load gets a number; an older load finishing after a newer one (a
+// rescan refresh landing during a page change) must not overwrite it.
+let loadSeq = 0;
 async function load() {
-  item.value = await api.getMediaItem(props.id);
+  const seq = ++loadSeq;
+  let next: MediaItem | null;
+  try {
+    next = await api.getMediaItem(props.id);
+  } catch (e) {
+    toast.error(String(e));
+    return;
+  }
+  if (seq !== loadSeq) return;
+  if (!next) {
+    // The title is gone: a rescan after a rename outside Vortex filed its
+    // files under a new one, or they were deleted. Follow the files rather
+    // than sit on a blank page.
+    const known = episodes.value.map((e) => e.path);
+    const successor = known.length ? await api.itemForPaths(known).catch(() => null) : null;
+    if (seq !== loadSeq) return;
+    if (successor != null && successor !== props.id) {
+      emit("replaced", successor);
+    } else {
+      toast("This title is no longer in the library");
+      emit("back");
+    }
+    return;
+  }
+  item.value = next;
   episodes.value = await api.listEpisodes(props.id);
   loadDetails(false);
   loadTagData();

@@ -90,18 +90,34 @@ fn is_hidden(entry: &walkdir::DirEntry) -> bool {
     entry.file_name().to_string_lossy().starts_with('.')
 }
 
-pub fn scan_all(conn: &mut Connection) -> Result<ScanStats, String> {
+/// Where a scan has got to, for the status pill. During the walk `total`
+/// is 0 and `files` counts what has been found so far; while writing,
+/// `files` of `total` rows are done.
+pub struct ScanProgress<'a> {
+    pub library: &'a str,
+    pub library_index: usize,
+    pub library_count: usize,
+    pub writing: bool,
+    pub files: usize,
+    pub total: usize,
+}
+
+pub fn scan_all(conn: &mut Connection, progress: &mut dyn FnMut(ScanProgress)) -> Result<ScanStats, String> {
     let libs = db::list_libraries(conn).map_err(|e| e.to_string())?;
     let ignore = ignored_dirs(conn);
     let mut stats = ScanStats::default();
-    for lib in libs {
+    let library_count = libs.len();
+    for (library_index, lib) in libs.into_iter().enumerate() {
         if !lib.available {
             stats.libraries_skipped.push(lib.path.clone());
             continue;
         }
+        let mut report = |writing: bool, files: usize, total: usize| {
+            progress(ScanProgress { library: &lib.name, library_index, library_count, writing, files, total });
+        };
         // One library failing (removed from Settings mid-scan, a database
         // error) must not cost the others their scan.
-        match scan_library(conn, &lib, &ignore, &mut stats) {
+        match scan_library(conn, &lib, &ignore, &mut stats, &mut report) {
             Ok(true) => stats.libraries_scanned += 1,
             Ok(false) => stats.libraries_skipped.push(lib.path.clone()),
             Err(e) => {
@@ -243,8 +259,15 @@ fn movie_in(conn: &Connection, folder: &Path) -> rusqlite::Result<Option<i64>> {
 
 /// Returns false when the library went away during the walk; nothing is
 /// written then, so a drive pulled mid-scan loses nothing.
-fn scan_library(conn: &mut Connection, lib: &Library, ignore: &[String], stats: &mut ScanStats) -> Result<bool, String> {
+fn scan_library(
+    conn: &mut Connection,
+    lib: &Library,
+    ignore: &[String],
+    stats: &mut ScanStats,
+    progress: &mut dyn FnMut(bool, usize, usize),
+) -> Result<bool, String> {
     let root = Path::new(&lib.path);
+    progress(false, 0, 0);
     let mut seen_paths: HashSet<String> = HashSet::new();
     // (size, modified) -> new episode id, for matching renamed files afterwards.
     let mut inserted: Vec<(i64, i64, i64)> = Vec::new();
@@ -295,6 +318,10 @@ fn scan_library(conn: &mut Connection, lib: &Library, ignore: &[String], stats: 
             continue;
         }
         stats.files_seen += 1;
+        let found = stats.files_seen - files_before;
+        if found % 100 == 0 {
+            progress(false, found, 0);
+        }
         let modified = meta
             .modified()
             .ok()
@@ -323,8 +350,15 @@ fn scan_library(conn: &mut Connection, lib: &Library, ignore: &[String], stats: 
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
     let before = db::episode_fingerprints_for_library(&tx, lib.id).map_err(|e| e.to_string())?;
 
+    let to_write = episodes.len() + others.len();
+    progress(true, 0, to_write);
+    let mut written = 0usize;
     let mut write = |tx: &Connection, s: &Seen, kind: &str, title: &str, year: Option<i32>, item_id: Option<i64>,
                      season: Option<i32>, episode: Option<i32>, extra: Option<&str>| -> Result<(), String> {
+        written += 1;
+        if written % 50 == 0 || written == to_write {
+            progress(true, written, to_write);
+        }
         let subs_str = s.subtitles.clone();
         let item_id = match item_id {
             Some(id) => id,
@@ -496,7 +530,7 @@ mod tests {
 
         let mut conn = db::open(&root.join("test.db")).unwrap();
         db::add_library(&conn, root.to_str().unwrap()).unwrap();
-        let stats = scan_all(&mut conn).unwrap();
+        let stats = scan_all(&mut conn, &mut |_| {}).unwrap();
         assert_eq!(stats.files_seen, 4);
         assert_eq!(stats.added, 4);
 
@@ -540,7 +574,7 @@ mod tests {
             root.join("Shows/Breaking Bad/Season 1/Breaking Bad - S01E02 - Cat's in the Bag.mkv"),
         )
         .unwrap();
-        let stats = scan_all(&mut conn).unwrap();
+        let stats = scan_all(&mut conn, &mut |_| {}).unwrap();
         assert_eq!((stats.added, stats.removed, stats.renamed), (0, 0, 1));
         let eps = db::list_episodes(&conn, series[0].id).unwrap();
         let e02 = eps.iter().find(|e| e.episode == Some(2)).unwrap();
@@ -549,7 +583,7 @@ mod tests {
 
         // Rescan is idempotent; deleting a file removes its row.
         fs::remove_file(root.join("Shows/Breaking Bad/Season 2/breaking bad s02e01.mp4")).unwrap();
-        let stats = scan_all(&mut conn).unwrap();
+        let stats = scan_all(&mut conn, &mut |_| {}).unwrap();
         assert_eq!(stats.added, 0);
         assert_eq!(stats.removed, 1);
         assert_eq!(db::list_media(&conn, Some("series")).unwrap()[0].episode_count, 2);
@@ -580,7 +614,7 @@ mod tests {
 
         let mut conn = db::open(&root.join("test.db")).unwrap();
         db::add_library(&conn, root.to_str().unwrap()).unwrap();
-        let stats = scan_all(&mut conn).unwrap();
+        let stats = scan_all(&mut conn, &mut |_| {}).unwrap();
         assert_eq!(stats.extras, 7);
 
         let series = db::list_media(&conn, Some("series")).unwrap();
@@ -606,7 +640,7 @@ mod tests {
         {
             let mut c2 = db::open(&show_root.join("t.db")).unwrap();
             db::add_library(&c2, show_root.to_str().unwrap()).unwrap();
-            scan_all(&mut c2).unwrap();
+            scan_all(&mut c2, &mut |_| {}).unwrap();
             let s = db::list_media(&c2, Some("series")).unwrap();
             assert_eq!(s.len(), 1, "one series even when its folder is the library root");
             assert_eq!(s[0].episode_count, 1);

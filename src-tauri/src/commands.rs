@@ -100,6 +100,20 @@ pub fn get_media_item(state: State<AppState>, id: i64) -> R<Option<MediaItem>> {
     db::get_media_item(&conn, id).map_err(err)
 }
 
+/// The title now holding any of these files. A title page whose title was
+/// replaced by a rescan follows its files to the new one instead of going
+/// blank.
+#[tauri::command]
+pub fn item_for_paths(state: State<AppState>, paths: Vec<String>) -> R<Option<i64>> {
+    let conn = state.db.lock().map_err(err)?;
+    for p in &paths {
+        if let Some(id) = db::item_for_path(&conn, p).map_err(err)? {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
 /// Read under the database lock, then check the files with the lock
 /// released and off the main thread: touching a file on a sleeping drive
 /// takes seconds, and these used to freeze the whole window meanwhile.
@@ -287,6 +301,12 @@ pub fn fetch_posters(app: AppHandle, force: bool) -> R<()> {
     tmdb::fetch_missing(app, force)
 }
 
+/// Stop the running poster fetch at the next title.
+#[tauri::command]
+pub fn cancel_posters(app: AppHandle) {
+    tmdb::cancel_fetch(&app);
+}
+
 /// The TMDB client is blocking; it must never run (or be dropped) on the async
 /// runtime's worker threads, so every network command hops to a blocking thread.
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> R<T> + Send + 'static) -> R<T> {
@@ -304,7 +324,8 @@ pub async fn search_tmdb(app: AppHandle, kind: String, query: String, year: Opti
         if key.trim().is_empty() {
             return Err("Add your TMDB API key in Settings first".into());
         }
-        tmdb::search(&key, &kind, &query, year)
+        // By hand: show adult titles too, which TMDb otherwise hides.
+        tmdb::search(&key, &kind, &query, year, true)
     })
     .await
 }
@@ -361,7 +382,7 @@ pub async fn search(app: AppHandle, query: String) -> R<SearchResults> {
 #[tauri::command]
 pub async fn test_tmdb_key(key: String) -> R<String> {
     blocking(move || {
-        let results = tmdb::search(&key, "movie", "Inception", Some(2010))?;
+        let results = tmdb::search(&key, "movie", "Inception", Some(2010), false)?;
         Ok(format!("Key works ({} results for a test search)", results.len()))
     })
     .await
@@ -375,7 +396,7 @@ pub async fn connect_tmdb(app: AppHandle, key: String) -> R<()> {
         if key.is_empty() {
             return Err("Enter a key first".into());
         }
-        tmdb::search(&key, "movie", "Inception", Some(2010))?;
+        tmdb::search(&key, "movie", "Inception", Some(2010), false)?;
         let state = app.state::<AppState>();
         let conn = state.db.lock().map_err(err)?;
         db::set_setting(&conn, "tmdb_key", &key).map_err(err)?;
@@ -546,7 +567,11 @@ pub fn get_settings(state: State<AppState>) -> R<HashMap<String, String>> {
 #[tauri::command]
 pub fn set_setting(state: State<AppState>, key: String, value: String) -> R<()> {
     let conn = state.db.lock().map_err(err)?;
-    db::set_setting(&conn, &key, &value).map_err(err)
+    db::set_setting(&conn, &key, &value).map_err(err)?;
+    if key.starts_with("tmdb_") {
+        tmdb::load_prefs(&conn);
+    }
+    Ok(())
 }
 
 // ---- torrents ----

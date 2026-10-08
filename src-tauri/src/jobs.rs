@@ -3,13 +3,57 @@
 
 use crate::{db, probe, scanner, tmdb, tray, AppState};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
 #[derive(Serialize, Clone)]
 pub struct ScanDone {
     pub reason: String,
     pub stats: scanner::ScanStats,
+}
+
+/// What a background job is doing right now, for the status pill in the top
+/// bar. One event stream for every job, so the UI needs one listener.
+/// `total` is 0 while the extent is not known yet (a folder still being
+/// walked); `running` false is the job's last word.
+#[derive(Serialize, Clone)]
+pub struct Progress {
+    /// "scan", "posters", "durations", "rename" or "memory".
+    pub job: &'static str,
+    pub label: String,
+    pub done: usize,
+    pub total: usize,
+    /// The title or folder being worked on.
+    pub detail: Option<String>,
+    pub running: bool,
+}
+
+/// When each job last reported, so a tight loop does not flood the UI.
+static LAST_REPORT: LazyLock<Mutex<HashMap<&'static str, Instant>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+const REPORT_EVERY: Duration = Duration::from_millis(150);
+
+/// Report a job's progress. The first and last steps always go out; the
+/// ones between are thinned to a few per second.
+pub fn report(app: &AppHandle, job: &'static str, label: &str, done: usize, total: usize, detail: Option<String>) {
+    let edge = done == 0 || (total > 0 && done >= total);
+    if let Ok(mut last) = LAST_REPORT.lock() {
+        let now = Instant::now();
+        if !edge && last.get(job).map(|t| now.duration_since(*t) < REPORT_EVERY).unwrap_or(false) {
+            return;
+        }
+        last.insert(job, now);
+    }
+    let _ = app.emit("job-progress", Progress { job, label: label.to_string(), done, total, detail, running: true });
+}
+
+pub fn finished(app: &AppHandle, job: &'static str) {
+    if let Ok(mut last) = LAST_REPORT.lock() {
+        last.remove(job);
+    }
+    let _ = app.emit("job-progress", Progress { job, label: String::new(), done: 0, total: 0, detail: None, running: false });
 }
 
 pub fn setting_on(app: &AppHandle, key: &str, default: bool) -> bool {
@@ -81,6 +125,13 @@ impl Job {
         self.running.load(Ordering::SeqCst)
     }
 
+    /// Let go without serving a pass asked for meanwhile: the user stopped
+    /// the job, and a request made while it ran must not restart it.
+    pub fn release(&self) {
+        self.again.store(false, Ordering::SeqCst);
+        self.running.store(false, Ordering::SeqCst);
+    }
+
     /// Lets go of the job if the owner panics, which would otherwise leave it
     /// marked running, and every later request ignored, until restart.
     pub fn release_on_panic(&self) -> ReleaseOnPanic<'_> {
@@ -145,16 +196,26 @@ fn scan_once(app: &AppHandle, reason: &str) -> Result<scanner::ScanStats, String
     let state = app.state::<AppState>();
     let started = std::time::Instant::now();
     tracing::info!(reason, "scan starting");
+    report(app, "scan", "Scanning library", 0, 0, None);
     let result = {
         // A scan can run for minutes over external drives. Holding the
         // shared connection would block every synchronous command, and
         // those run on the main thread, so the window would freeze for
         // the duration. WAL mode lets the scan have its own connection.
         match db::open(&state.db_path) {
-            Ok(mut conn) => scanner::scan_all(&mut conn),
+            Ok(mut conn) => scanner::scan_all(&mut conn, &mut |p: scanner::ScanProgress| {
+                // Each library is one equal slice of the bar: the walk has
+                // no known extent, so a library's slice fills only while
+                // its rows are written.
+                let within = if p.writing && p.total > 0 { 100 * p.files.min(p.total) / p.total } else { 0 };
+                let label = if p.writing { "Updating library" } else { "Scanning library" };
+                let detail = format!("{} · {} files", p.library, p.files);
+                report(app, "scan", label, p.library_index * 100 + within, p.library_count * 100, Some(detail));
+            }),
             Err(e) => Err(e.to_string()),
         }
     };
+    finished(app, "scan");
     match &result {
         Ok(s) => tracing::info!(
             reason,
@@ -190,7 +251,7 @@ fn scan_once(app: &AppHandle, reason: &str) -> Result<scanner::ScanStats, String
                     let _ = app.emit("library-changed", ());
                 }
                 let _ = probe::probe_missing(app.clone());
-                if setting_on(app, "tmdb_connected", false) {
+                if setting_on(app, "tmdb_connected", false) && setting_on(app, "tmdb_auto_match", true) {
                     let _ = tmdb::fetch_missing(app.clone(), false);
                 }
             }
