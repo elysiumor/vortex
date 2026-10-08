@@ -54,7 +54,11 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
-codegen-units = 1
+# Not 1: with no page file on the build machine, optimising the whole crate
+# as one unit ran LLVM out of memory ("Allocation failed", 0xc0000409).
+# Four units keep the peak well under what is free; thin LTO still
+# optimises across them.
+codegen-units = 4
 # Thin rather than fat: fat LTO's final step needed more memory than this
 # machine could commit (no page file) and the release build died there with
 # "LLVM out of memory". Thin keeps nearly all of the speed for a fraction.
