@@ -65,7 +65,7 @@ defineExpose({ reload: load });
 <template>
   <div ref="root" v-if="!current" class="space-y-5">
     <div class="flex items-center gap-3">
-      <h1 class="flex-1 text-2xl font-semibold tracking-tight">Collections</h1>
+      <h1 class="flex-1 text-[2.6rem] font-black leading-none tracking-[-0.04em]">Collections</h1>
       <Input v-model="newName" placeholder="New collection name" class="h-9 w-56" @keyup.enter="create" />
       <Button :disabled="!newName.trim()" @click="create"><Plus /> Create</Button>
     </div>

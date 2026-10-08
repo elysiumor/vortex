@@ -3,10 +3,11 @@ import { onMounted, onUnmounted, ref } from "vue";
 import { toast } from "vue-sonner";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { FolderPlus, HardDrive, RefreshCw, Trash2, Check, Download, Upload, Sun, Moon, Monitor, KeyRound, Power, FileText, FolderOpen, FilePen } from "@lucide/vue";
-import { api, type DetectedPlayer, type Drive, type Library, type PosterProgress, type ScanStats, type TorrentStatus } from "../lib/api";
-import { applyTheme, loadTheme, type Theme } from "../lib/theme";
+import { api, type DetectedPlayer, type Drive, type Library, type PosterProgress, type ScanStats, type TmdbStore, type TorrentStatus } from "../lib/api";
+import { applyTheme, currentTheme, type Theme } from "../lib/theme";
 import RenameDialog from "./RenameDialog.vue";
 import { Button } from "@/components/ui/button";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
@@ -20,8 +21,9 @@ import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, 
 const emit = defineEmits<{ scanned: [] }>();
 
 // ---- general ----
-const theme = ref<Theme>(loadTheme());
-function setTheme(t: Theme) { theme.value = t; applyTheme(t); }
+// Shared with the top bar and Ctrl+K, so a change there shows here too.
+const theme = currentTheme;
+function setTheme(t: Theme) { applyTheme(t); }
 const flags = ref<Record<string, boolean>>({ rescan_on_startup: true, watch_folders: true, close_to_tray: true, autoplay_next: true, notify_new: true });
 async function setFlag(key: string, value: boolean) { flags.value[key] = value; await api.setSetting(key, value ? "1" : "0"); }
 const flagRows: [string, string, string][] = [
@@ -101,6 +103,8 @@ async function removeTmdb() { await api.disconnectTmdb(); tmdbMasked.value = nul
 // ---- rename to TMDb names ----
 const renameOpen = ref(false);
 const canUndoRename = ref(false);
+const store = ref<TmdbStore | null>(null);
+async function refreshStore() { store.value = await api.tmdbStore().catch(() => null); }
 async function refreshUndo() { canUndoRename.value = await api.renameCanUndo().catch(() => false); }
 async function afterRename() { await refreshUndo(); emit("scanned"); }
 async function undoRename() {
@@ -222,13 +226,14 @@ onMounted(async () => {
   }));
   if (!unmounted) await load();
   if (!unmounted) await refreshUndo();
+  if (!unmounted) await refreshStore();
 });
 onUnmounted(() => { unmounted = true; unlisteners.forEach((u) => u()); });
 </script>
 
 <template>
   <div class="mx-auto max-w-4xl space-y-6">
-    <h1 class="text-2xl font-semibold tracking-tight">Settings</h1>
+    <h1 class="text-[2.6rem] font-black leading-none tracking-[-0.04em]">Settings</h1>
 
     <Card>
       <CardHeader><CardTitle>Appearance &amp; behaviour</CardTitle></CardHeader>
@@ -236,7 +241,9 @@ onUnmounted(() => { unmounted = true; unlisteners.forEach((u) => u()); });
         <div class="flex items-center justify-between">
           <div class="text-sm font-medium">Theme</div>
           <div class="flex gap-1 rounded-lg bg-muted p-1">
-            <Button v-for="[t, label, icon] in ([['system', 'System', Monitor], ['light', 'Light', Sun], ['dark', 'Dark', Moon]] as const)" :key="t" size="sm" :variant="theme === t ? 'default' : 'ghost'" @click="setTheme(t)"><component :is="icon" /> {{ label }}</Button>
+            <ToggleGroup type="single" variant="outline" :model-value="theme" class="rounded-full" @update:model-value="(v) => v && setTheme(v as Theme)">
+              <ToggleGroupItem v-for="[t, label, icon] in ([['system', 'System', Monitor], ['light', 'Light', Sun], ['dark', 'Dark', Moon]] as const)" :key="t" :value="t" class="gap-1.5 px-3 data-[state=on]:bg-primary data-[state=on]:text-primary-foreground"><component :is="icon" /> {{ label }}</ToggleGroupItem>
+            </ToggleGroup>
           </div>
         </div>
         <div v-for="[key, label, hint] in flagRows" :key="key" class="flex items-center justify-between gap-4">
@@ -354,6 +361,10 @@ onUnmounted(() => { unmounted = true; unlisteners.forEach((u) => u()); });
           <Progress :model-value="100 * posterProgress.done / posterProgress.total" class="h-1.5" />
           <div class="mt-1 text-xs text-muted-foreground">{{ posterProgress.done }} / {{ posterProgress.total }} · {{ posterProgress.matched }} matched<span v-if="fetching && posterProgress.current"> · {{ posterProgress.current }}</span></div>
         </div>
+        <p v-if="store && store.titles > 0" class="text-xs text-muted-foreground">
+          Saved on this PC: {{ store.titles }} matched title{{ store.titles === 1 ? "" : "s" }}, {{ store.images }} images ({{ (store.image_bytes / 1048576).toFixed(0) }} MB).
+          Folders you switch back to get their posters and details from here, without asking TMDb.
+        </p>
         <div v-if="tmdbMasked" class="flex flex-wrap items-center gap-2 border-t pt-3">
           <div class="min-w-0 flex-1">
             <div class="text-sm font-medium">Rename files to TMDb names</div>

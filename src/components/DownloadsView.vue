@@ -6,6 +6,7 @@ import { Download, FileUp, FolderOpen, Play, Pause, Trash2, ShieldCheck, ShieldA
 import { api, type SessionStatus, type StreamEnded, type TorrentDetail, type TorrentPreview, type TorrentRow, type TorrentStatus } from "../lib/api";
 import EmptyState from "./EmptyState.vue";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
@@ -322,7 +323,7 @@ defineExpose({ reload: async () => { await refreshStatus(); await refreshList();
 <template>
   <div class="space-y-5">
     <div class="flex flex-wrap items-center gap-3">
-      <h1 class="text-2xl font-semibold tracking-tight">Downloads</h1>
+      <h1 class="text-[2.6rem] font-black leading-none tracking-[-0.04em]">Downloads</h1>
       <template v-if="status">
         <Badge v-if="status.running && status.protected" variant="secondary" class="gap-1 text-emerald-600 dark:text-emerald-400"><ShieldCheck class="size-3.5" /> Protected via proxy</Badge>
         <Badge v-else-if="status.running" variant="secondary" class="gap-1 text-amber-600 dark:text-amber-400"><ShieldAlert class="size-3.5" /> Unprotected — your IP is visible to peers</Badge>
@@ -503,7 +504,7 @@ defineExpose({ reload: async () => { await refreshStatus(); await refreshList();
             <Button variant="outline" @click="browseSaveIn"><FolderOpen /> Browse…</Button>
           </div>
           <label class="flex cursor-pointer items-center gap-2 text-sm">
-            <input type="checkbox" class="accent-primary" v-model="createSubfolder" />
+            <Checkbox v-model="createSubfolder" />
             Create subfolder
           </label>
           <div v-if="createSubfolder" class="flex items-center gap-2">
@@ -520,7 +521,7 @@ defineExpose({ reload: async () => { await refreshStatus(); await refreshList();
         </div>
         <div class="max-h-80 space-y-0.5 overflow-y-auto rounded-md border p-1">
           <label v-for="f in preview?.files" :key="f.index" class="flex cursor-pointer items-center gap-3 rounded px-2 py-1.5 text-sm hover:bg-accent">
-            <input type="checkbox" class="accent-primary" :checked="picked.has(f.index)" @change="togglePick(f.index)" />
+            <Checkbox :model-value="picked.has(f.index)" @update:model-value="togglePick(f.index)" @click.stop />
             <span class="min-w-0 flex-1 truncate" :class="f.video ? '' : 'text-muted-foreground'" :title="f.path">{{ f.path }}</span>
             <span class="shrink-0 text-xs text-muted-foreground">{{ fmtBytes(f.size) }}</span>
           </label>

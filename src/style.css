@@ -1,63 +1,90 @@
 @import "tailwindcss";
 @import "tw-animate-css";
+@import "@fontsource-variable/inter";
 
 @custom-variant dark (&:is(.dark *));
 
+/*
+ * Vortex palette. The brand is a yellow → lime → green sweep on a near-black
+ * green in dark mode, and a fresh off-white in light mode. Lime carries the
+ * accent in dark; in light it is too pale for text, so accents there use a
+ * deeper green while the vivid sweep stays on buttons and decoration.
+ */
 :root {
-  --radius: 0.625rem;
-  --background: oklch(0.985 0.002 260);
-  --foreground: oklch(0.17 0.01 260);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.17 0.01 260);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.17 0.01 260);
-  --primary: oklch(0.55 0.2 264);
-  --primary-foreground: oklch(0.99 0 0);
-  --secondary: oklch(0.955 0.005 260);
-  --secondary-foreground: oklch(0.25 0.01 260);
-  --muted: oklch(0.955 0.005 260);
-  --muted-foreground: oklch(0.5 0.015 260);
-  --accent: oklch(0.945 0.01 264);
-  --accent-foreground: oklch(0.25 0.01 260);
-  --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.91 0.005 260);
-  --input: oklch(0.91 0.005 260);
-  --ring: oklch(0.55 0.2 264);
-  --success: oklch(0.6 0.17 150);
-  --warning: oklch(0.78 0.16 80);
-  --sidebar: oklch(0.975 0.003 260);
-  --sidebar-foreground: oklch(0.3 0.01 260);
-  --sidebar-border: oklch(0.91 0.005 260);
+  --radius: 0.75rem;
+  --brand-yellow: #ffe606;
+  --brand-lime: #b3ea3f;
+  --brand-green: #3af09a;
+  /* Fills (buttons, bars, glows): always the vivid sweep, with dark ink on top. */
+  --brand: linear-gradient(100deg, var(--brand-yellow) 0%, var(--brand-lime) 48%, var(--brand-green) 100%);
+  --brand-ink: #07130a;
+
+  --background: #f4f6f1;
+  --foreground: #0d150e;
+  --card: #ffffff;
+  --card-foreground: #0d150e;
+  --popover: #ffffff;
+  --popover-foreground: #0d150e;
+  --primary: #12803d;
+  --primary-foreground: #ffffff;
+  --secondary: #e8ede2;
+  --secondary-foreground: #172119;
+  --muted: #eaeee5;
+  --muted-foreground: #5a675c;
+  --accent: #e2e9da;
+  --accent-foreground: #172119;
+  --destructive: #d63a2c;
+  --border: #dbe2d3;
+  --input: #d2dac9;
+  --ring: #22a356;
+  --success: #17964a;
+  --warning: #b97c00;
+  --sidebar: #eef2ea;
+  --sidebar-foreground: #26322a;
+  --sidebar-border: #dbe2d3;
+  /* Text in the brand colours must stay readable on white. */
+  --brand-text: linear-gradient(100deg, #6b5f00 0%, #3f7a08 45%, #087a47 100%);
+  --nav-glass: rgb(244 246 241 / 0.86);
+  --ambient: radial-gradient(1200px 520px at 15% -10%, rgb(179 234 63 / 0.18), transparent 70%),
+    radial-gradient(900px 480px at 100% 0%, rgb(58 240 154 / 0.12), transparent 70%);
+  --card-shadow: 0 1px 2px rgb(13 21 14 / 0.06), 0 8px 24px -12px rgb(13 21 14 / 0.18);
+  --card-shadow-hover: 0 22px 48px -18px rgb(13 21 14 / 0.38);
 }
 
 .dark {
-  --background: oklch(0.14 0.008 262);
-  --foreground: oklch(0.94 0.005 260);
-  --card: oklch(0.185 0.01 262);
-  --card-foreground: oklch(0.94 0.005 260);
-  --popover: oklch(0.2 0.01 262);
-  --popover-foreground: oklch(0.94 0.005 260);
-  --primary: oklch(0.68 0.17 264);
-  --primary-foreground: oklch(0.13 0.02 264);
-  --secondary: oklch(0.24 0.01 262);
-  --secondary-foreground: oklch(0.94 0.005 260);
-  --muted: oklch(0.24 0.01 262);
-  --muted-foreground: oklch(0.65 0.015 260);
-  --accent: oklch(0.26 0.015 264);
-  --accent-foreground: oklch(0.96 0.005 260);
-  --destructive: oklch(0.65 0.2 25);
-  --border: oklch(1 0 0 / 9%);
-  --input: oklch(1 0 0 / 12%);
-  --ring: oklch(0.68 0.17 264);
-  --success: oklch(0.72 0.17 150);
-  --warning: oklch(0.82 0.16 80);
-  --sidebar: oklch(0.165 0.01 262);
-  --sidebar-foreground: oklch(0.8 0.01 260);
-  --sidebar-border: oklch(1 0 0 / 8%);
+  --background: #060a07;
+  --foreground: #edf3ee;
+  --card: #0d140e;
+  --card-foreground: #edf3ee;
+  --popover: #111a12;
+  --popover-foreground: #edf3ee;
+  --primary: #b3ea3f;
+  --primary-foreground: #0b1606;
+  --secondary: #172018;
+  --secondary-foreground: #edf3ee;
+  --muted: #141c15;
+  --muted-foreground: #8b998d;
+  --accent: #1a241b;
+  --accent-foreground: #f2f7f2;
+  --destructive: #ff5c4d;
+  --border: rgb(255 255 255 / 0.08);
+  --input: rgb(255 255 255 / 0.12);
+  --ring: #8fdc4a;
+  --success: #3af09a;
+  --warning: #ffd84d;
+  --sidebar: #0a100b;
+  --sidebar-foreground: #c9d4ca;
+  --sidebar-border: rgb(255 255 255 / 0.07);
+  --brand-text: var(--brand);
+  --nav-glass: rgb(6 10 7 / 0.84);
+  --ambient: radial-gradient(1200px 520px at 15% -10%, rgb(179 234 63 / 0.10), transparent 70%),
+    radial-gradient(900px 480px at 100% 0%, rgb(58 240 154 / 0.07), transparent 70%);
+  --card-shadow: 0 1px 2px rgb(0 0 0 / 0.4);
+  --card-shadow-hover: 0 24px 50px -16px rgb(0 0 0 / 0.85), 0 0 0 1px rgb(179 234 63 / 0.35);
 }
 
 @theme inline {
-  --font-sans: "Inter", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  --font-sans: "Inter Variable", "Inter", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
@@ -85,6 +112,9 @@
   --color-sidebar: var(--sidebar);
   --color-sidebar-foreground: var(--sidebar-foreground);
   --color-sidebar-border: var(--sidebar-border);
+  --color-brand-ink: var(--brand-ink);
+  --color-brand-lime: var(--brand-lime);
+  --color-brand-green: var(--brand-green);
 }
 
 @layer base {
@@ -97,7 +127,10 @@
   }
   body {
     @apply bg-background text-foreground antialiased overflow-hidden;
-    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    background-image: var(--ambient);
+    background-attachment: fixed;
+    font-feature-settings: "cv11", "ss01", "ss03";
+    letter-spacing: -0.006em;
   }
   ::selection {
     @apply bg-primary/25;
@@ -105,14 +138,52 @@
   ::-webkit-scrollbar { width: 10px; height: 10px; }
   ::-webkit-scrollbar-thumb { @apply bg-foreground/15 rounded-full border-[3px] border-solid border-transparent bg-clip-padding; }
   ::-webkit-scrollbar-thumb:hover { @apply bg-foreground/25; }
+  ::-webkit-scrollbar-track { background: transparent; }
 }
 
-@layer utilities {
-  .poster-shadow { box-shadow: 0 12px 40px -12px rgb(0 0 0 / 0.5); }
-  .hero-fade {
-    background:
-      linear-gradient(90deg, var(--background) 0%, color-mix(in oklch, var(--background) 85%, transparent) 45%, color-mix(in oklch, var(--background) 45%, transparent) 100%),
-      linear-gradient(180deg, color-mix(in oklch, var(--background) 30%, transparent) 0%, var(--background) 100%);
+/* Declared with @utility so hover/focus/group variants apply to them. */
+/* The brand sweep as a fill, with dark ink on top in both themes. */
+@utility bg-brand { background-image: var(--brand); color: var(--brand-ink); }
+/* The brand sweep as text; deeper in light mode so it stays readable. */
+@utility text-brand { background-image: var(--brand-text); -webkit-background-clip: text; background-clip: text; color: transparent; }
+@utility glass {
+  background: var(--nav-glass);
+  backdrop-filter: blur(18px) saturate(150%);
+  -webkit-backdrop-filter: blur(18px) saturate(150%);
+}
+/* Frosted control over pictures (hero buttons, badges on posters). */
+@utility glass-dark {
+  background: rgb(10 14 11 / 0.55);
+  color: #fff;
+  backdrop-filter: blur(12px) saturate(140%);
+  -webkit-backdrop-filter: blur(12px) saturate(140%);
+}
+@utility card-shadow { box-shadow: var(--card-shadow); }
+@utility card-shadow-hover { box-shadow: var(--card-shadow-hover); }
+@utility poster-shadow { box-shadow: 0 24px 60px -20px rgb(0 0 0 / 0.65); }
+/* Section heading with the brand bar in front, as in the IMDS rows. */
+@utility section-title {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-weight: 650;
+  letter-spacing: -0.015em;
+  &::before {
+    content: "";
+    width: 4px;
+    height: 1.05em;
+    border-radius: 999px;
+    background-image: linear-gradient(180deg, var(--brand-yellow), var(--brand-lime) 50%, var(--brand-green));
+    flex: none;
   }
-  .no-scrollbar::-webkit-scrollbar { display: none; }
+}
+/* Picture behind a hero: fades to the page at the left and the bottom. */
+@utility hero-fade {
+  background:
+    linear-gradient(90deg, var(--background) 0%, color-mix(in oklch, var(--background) 82%, transparent) 30%, color-mix(in oklch, var(--background) 20%, transparent) 62%, transparent 100%),
+    linear-gradient(180deg, color-mix(in oklch, var(--background) 35%, transparent) 0%, transparent 22%, transparent 55%, var(--background) 100%);
+}
+@utility no-scrollbar {
+  scrollbar-width: none;
+  &::-webkit-scrollbar { display: none; }
 }

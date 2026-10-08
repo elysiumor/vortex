@@ -5,7 +5,13 @@
  * IPC and uncaught errors actually happen. This module reports those three
  * things so a "the app is slow" report arrives with numbers attached.
  */
-import { invoke } from "@tauri-apps/api/core";
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { previewInvoke, previewMode } from "./preview";
+
+/** The real bridge, or sample data when designing in a plain browser. */
+function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  return previewMode ? (previewInvoke(cmd, args) as Promise<T>) : tauriInvoke<T>(cmd, args);
+}
 
 /** Anything slower than this blocks a frame badly enough to be felt. */
 const SLOW_CALL_MS = 250;

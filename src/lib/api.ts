@@ -1,7 +1,21 @@
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { convertFileSrc as tauriFileSrc } from "@tauri-apps/api/core";
 // Every command is timed; anything slow enough to block a frame is logged.
 import { timedInvoke as invoke } from "./diag";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { listen as tauriListen, type EventCallback, type UnlistenFn } from "@tauri-apps/api/event";
+import { previewMode } from "./preview";
+
+/**
+ * Local image files go through Tauri's asset protocol, with `v` busting the
+ * WebView cache when a title's match changes. Ready-made URLs pass as they are.
+ */
+function imageSrc(path: string, v: number | null): string {
+  return /^(data|https?):/.test(path) ? path : `${tauriFileSrc(path)}?v=${v ?? 0}`;
+}
+
+/** Events need the Tauri bridge; the browser design preview has none. */
+function listen<T>(event: string, cb: EventCallback<T>): Promise<UnlistenFn> {
+  return previewMode ? Promise.resolve(() => {}) : tauriListen<T>(event, cb);
+}
 
 export interface Library {
   id: number;
@@ -117,6 +131,14 @@ export interface ScanDone {
   stats: ScanStats;
 }
 
+export interface TmdbStore {
+  /** Titles whose TMDb match is remembered, kept when their folder is removed. */
+  titles: number;
+  details: number;
+  images: number;
+  image_bytes: number;
+}
+
 /** One rename on disk, file or folder. */
 export interface RenameMove {
   from: string;
@@ -193,7 +215,7 @@ export interface PosterProgress {
 
 /** Local poster file -> URL the webview can load. Cache-busted by TMDB id. */
 export function posterSrc(m: { poster_path: string | null; tmdb_id: number | null }): string | null {
-  return m.poster_path ? `${convertFileSrc(m.poster_path)}?v=${m.tmdb_id ?? 0}` : null;
+  return m.poster_path ? imageSrc(m.poster_path, m.tmdb_id) : null;
 }
 
 export interface EpisodeHit {
@@ -307,12 +329,12 @@ export interface Drive {
 }
 
 export function collectionPoster(t: Tag): string | null {
-  if (t.first_poster) return `${convertFileSrc(t.first_poster)}?v=${t.first_tmdb_id ?? 0}`;
+  if (t.first_poster) return imageSrc(t.first_poster, t.first_tmdb_id);
   return t.poster_url;
 }
 
 export function backdropSrc(d: Details): string | null {
-  return d.backdrop_path ? `${convertFileSrc(d.backdrop_path)}?v=${d.tmdb_id}` : null;
+  return d.backdrop_path ? imageSrc(d.backdrop_path, d.tmdb_id) : null;
 }
 
 export const api = {
@@ -333,6 +355,10 @@ export const api = {
   createBackup: (path: string) => invoke<BackupInfo>("create_backup", { path }),
   restoreBackup: (path: string) => invoke<void>("restore_backup", { path }),
   onLibraryRestored: (cb: () => void): Promise<UnlistenFn> => listen("library-restored", () => cb()),
+  /** TMDb data applied from the local store after a scan (a folder switched back in). */
+  onLibraryChanged: (cb: () => void): Promise<UnlistenFn> => listen("library-changed", () => cb()),
+  /** How much TMDb data is kept locally. */
+  tmdbStore: () => invoke<TmdbStore>("tmdb_store"),
   getDetails: (mediaItemId: number, refresh = false) =>
     invoke<Details | null>("get_details", { mediaItemId, refresh }),
   listHistory: (limit = 300) => invoke<HistoryEntry[]>("list_history", { limit }),

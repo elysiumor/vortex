@@ -144,16 +144,16 @@ defineExpose({ reload: load });
 
 <template>
   <div ref="root">
-    <div class="mb-5 flex flex-wrap items-center gap-2">
-      <h1 class="mr-auto flex items-center gap-2 text-2xl font-semibold tracking-tight">
+    <div class="mb-8 flex flex-wrap items-center gap-2">
+      <h1 class="mr-auto flex items-baseline gap-3 text-[2.6rem] font-black leading-none tracking-[-0.04em]">
         <Sparkles v-if="smart" class="size-5 text-primary" />
         {{ title }}
-        <span class="text-base font-normal text-muted-foreground">{{ sorted.length }}</span>
+        <span class="text-base font-semibold tracking-normal text-muted-foreground">{{ sorted.length }}</span>
       </h1>
-      <Input v-model="query" placeholder="Filter by title" class="h-9 w-52" />
+      <Input v-model="query" placeholder="Filter by title" class="h-9 w-56 rounded-full" />
       <template v-if="!smart">
         <Select v-model="filter">
-          <SelectTrigger class="w-32"><SelectValue /></SelectTrigger>
+          <SelectTrigger class="w-32 rounded-full"><SelectValue /></SelectTrigger>
           <SelectContent>
             <SelectItem value="all">All</SelectItem>
             <SelectItem value="unwatched">Unwatched</SelectItem>
@@ -161,20 +161,20 @@ defineExpose({ reload: load });
           </SelectContent>
         </Select>
         <Select v-model="category" v-if="categories.length > 1">
-          <SelectTrigger class="w-40"><SelectValue placeholder="Category" /></SelectTrigger>
+          <SelectTrigger class="w-40 rounded-full"><SelectValue placeholder="Category" /></SelectTrigger>
           <SelectContent><SelectItem value="all">All categories</SelectItem><SelectItem v-for="c in categories" :key="c" :value="c">{{ c }}</SelectItem></SelectContent>
         </Select>
         <Select v-model="genre" v-if="genres.length">
-          <SelectTrigger class="w-40"><SelectValue placeholder="Genre" /></SelectTrigger>
+          <SelectTrigger class="w-40 rounded-full"><SelectValue placeholder="Genre" /></SelectTrigger>
           <SelectContent><SelectItem value="all">All genres</SelectItem><SelectItem v-for="g in genres" :key="g" :value="g">{{ g }}</SelectItem></SelectContent>
         </Select>
         <Select v-model="tag" v-if="tags.length">
-          <SelectTrigger class="w-36"><SelectValue placeholder="Tag" /></SelectTrigger>
+          <SelectTrigger class="w-36 rounded-full"><SelectValue placeholder="Tag" /></SelectTrigger>
           <SelectContent><SelectItem value="all">All tags</SelectItem><SelectItem v-for="x in tags" :key="x" :value="x">{{ x }}</SelectItem></SelectContent>
         </Select>
       </template>
       <Select v-model="sort">
-        <SelectTrigger class="w-44"><SelectValue /></SelectTrigger>
+        <SelectTrigger class="w-44 rounded-full"><SelectValue /></SelectTrigger>
         <SelectContent>
           <SelectItem value="title">A → Z</SelectItem>
           <SelectItem value="year">Newest year</SelectItem>
@@ -184,7 +184,7 @@ defineExpose({ reload: load });
           <SelectItem value="size">Largest</SelectItem>
         </SelectContent>
       </Select>
-      <Button v-if="!smart" variant="outline" size="sm" :title="hasFilters ? 'Save these filters as a smart list' : 'Set a filter first, or save a list with rating/age rules'" @click="saveOpen = true">
+      <Button v-if="!smart" variant="outline" size="sm" class="rounded-full" :title="hasFilters ? 'Save these filters as a smart list' : 'Set a filter first, or save a list with rating/age rules'" @click="saveOpen = true">
         <Save /> Smart list
       </Button>
     </div>
@@ -199,15 +199,15 @@ defineExpose({ reload: load });
       <Badge variant="secondary" v-if="smart.untouchedDays">untouched {{ smart.untouchedDays }}+ days</Badge>
     </div>
 
-    <div v-if="loading" class="grid grid-cols-[repeat(auto-fill,minmax(160px,1fr))] gap-4">
+    <div v-if="loading" class="grid grid-cols-[repeat(auto-fill,minmax(168px,1fr))] gap-x-5 gap-y-8">
       <Skeleton v-for="i in 12" :key="i" class="aspect-[2/3] rounded-xl" />
     </div>
     <EmptyState v-else-if="items.length === 0" title="Nothing here yet" hint="Add a folder or drive in Settings. Scanning starts right away.">
       <template #icon><component :is="kind === 'movie' ? Film : Tv" class="size-6" /></template>
     </EmptyState>
     <EmptyState v-else-if="sorted.length === 0" title="No matches" hint="Try clearing a filter." />
-    <div v-else class="grid grid-cols-[repeat(auto-fill,minmax(160px,1fr))] gap-4">
-      <MediaCard v-for="m in sorted" :key="m.id" :title="m.title" :poster="posterSrc(m)" :subtitle="sub(m)"
+    <div v-else class="grid grid-cols-[repeat(auto-fill,minmax(168px,1fr))] gap-x-5 gap-y-8">
+      <MediaCard v-for="m in sorted" :key="m.id" :title="m.title" :poster="posterSrc(m)" :subtitle="sub(m)" :rating="m.rating"
                  :meta="category === 'all' && !smart ? m.category ?? undefined : undefined" :badge="badge(m)"
                  :done="m.episode_count > 0 && m.watched_count >= m.episode_count"
                  :progress="m.kind === 'series' && m.episode_count ? m.watched_count / m.episode_count : null"

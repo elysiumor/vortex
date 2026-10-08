@@ -20,10 +20,15 @@ fn run(app: AppHandle) {
     // Folder names the scanner skips; refreshed every pass of the loop below.
     let ignore: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(scanner::DEFAULT_IGNORED_DIRS.iter().map(|s| s.to_string()).collect()));
     let ignore_events = ignore.clone();
+    // Library roots, so only folders below a root are matched against the
+    // ignore list: a library at "D:\Temp\Movies" must still be watched.
+    let roots: Arc<Mutex<Vec<std::path::PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+    let roots_events = roots.clone();
     let mut debouncer = match new_debouncer(Duration::from_secs(3), move |res: DebounceEventResult| {
         if let Ok(events) = res {
             let ignore = ignore_events.lock().map(|g| g.clone()).unwrap_or_default();
-            if let Some(e) = events.iter().find(|e| is_relevant(&e.path, &ignore)) {
+            let roots = roots_events.lock().map(|g| g.clone()).unwrap_or_default();
+            if let Some(e) = events.iter().find(|e| is_relevant(&e.path, &ignore, &roots)) {
                 let _ = tx.send(e.path.clone());
             }
         }
@@ -58,6 +63,9 @@ fn run(app: AppHandle) {
         // synchronous command, which Tauri runs on the main thread.
         db::fill_availability(&mut libs);
         let libs = libs;
+        if let Ok(mut r) = roots.lock() {
+            *r = libs.iter().map(|l| std::path::PathBuf::from(&l.path)).collect();
+        }
         let mut newly_available = false;
         for lib in &libs {
             if lib.available && !watched.contains(&lib.path) {
@@ -108,11 +116,13 @@ fn run(app: AppHandle) {
     }
 }
 
-fn is_relevant(p: &Path, ignore: &[String]) -> bool {
+fn is_relevant(p: &Path, ignore: &[String], roots: &[std::path::PathBuf]) -> bool {
     // Torrent pieces land in `.incomplete`, and folders the scanner skips
     // (caches, AppData on a whole-drive library) churn constantly; a scan per
-    // write would be wasteful.
-    let skipped = p.components().any(|c| {
+    // write would be wasteful. Only the part below the library root counts,
+    // as in the scanner.
+    let below = roots.iter().filter_map(|r| p.strip_prefix(r).ok()).min_by_key(|rel| rel.components().count()).unwrap_or(p);
+    let skipped = below.components().any(|c| {
         let name = c.as_os_str().to_string_lossy().to_lowercase();
         name == crate::torrent::STAGING_DIR || ignore.contains(&name)
     });

@@ -29,7 +29,7 @@ async function play(id: number) { try { await api.playEpisode(id); } catch (e) {
 
 <template>
   <div ref="root" class="space-y-8">
-    <h1 class="text-2xl font-semibold tracking-tight">Search <span class="font-normal text-muted-foreground">{{ query }}</span></h1>
+    <h1 class="text-[2.6rem] font-black leading-none tracking-[-0.04em]">Search <span class="font-normal text-muted-foreground">{{ query }}</span></h1>
     <EmptyState v-if="!busy && results.items.length === 0 && results.episodes.length === 0" title="No matches" hint="Titles, episode names and file names are searched."><template #icon><SearchX class="size-6" /></template></EmptyState>
 
     <section v-if="results.items.length">

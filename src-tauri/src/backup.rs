@@ -27,9 +27,11 @@ pub fn create(app: &AppHandle, dest: &Path) -> Result<BackupInfo, String> {
     let snapshot = dir.join("backup-snapshot.db");
     let _ = std::fs::remove_file(&snapshot);
     {
-        // VACUUM INTO writes a complete, consistent copy including everything still in the WAL.
+        // VACUUM INTO writes a complete, consistent copy including everything
+        // still in the WAL. On a connection of its own: the copy can take a
+        // while, and holding the shared one froze every other command for it.
         let state = app.state::<AppState>();
-        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let conn = Connection::open(&state.db_path).map_err(|e| e.to_string())?;
         conn.execute("VACUUM INTO ?1", [snapshot.to_string_lossy().to_string()]).map_err(|e| e.to_string())?;
     }
 
@@ -100,22 +102,30 @@ pub fn restore(app: &AppHandle, src: &Path) -> Result<(), String> {
     // (the swap then fails on Windows) and would write the old database's ids
     // into the new one.
     let state = app.state::<AppState>();
-    if state.scan_job.is_running() || state.fetch_job.is_running() || state.probe_job.is_running() {
+    if state.fetch_job.is_running() || state.probe_job.is_running() {
         let _ = std::fs::remove_file(&incoming);
-        return Err("A library scan, poster fetch or duration check is running. Try again when it finishes.".into());
+        return Err("A poster fetch or duration check is running. Try again when it finishes.".into());
     }
 
-    // Swap the live database under the lock so nothing else touches it mid-way.
+    // Swap the live database under the lock so nothing else touches it
+    // mid-way, and with scans held off: a scan opens the file on its own
+    // connection, which made the swap fail or recreated an empty database.
     let live = dir.join("vortex.db");
-    {
+    crate::jobs::exclusive(app, || -> Result<(), String> {
         let mut guard = state.db.lock().map_err(|e| e.to_string())?;
         let old = std::mem::replace(&mut *guard, Connection::open_in_memory().map_err(|e| e.to_string())?);
         drop(old);
         for suffix in ["-wal", "-shm"] {
             let _ = std::fs::remove_file(dir.join(format!("vortex.db{suffix}")));
         }
+        // The copy set aside by an earlier restore is kept one step back
+        // rather than deleted: it may be the only good copy.
         let keep_old = dir.join("vortex.db.before-restore");
-        let _ = std::fs::remove_file(&keep_old);
+        if keep_old.exists() {
+            let older = dir.join("vortex.db.before-restore.1");
+            let _ = std::fs::remove_file(&older);
+            let _ = std::fs::rename(&keep_old, &older);
+        }
         let swapped = (|| {
             std::fs::rename(&live, &keep_old).map_err(|e| format!("could not set the current database aside: {e}"))?;
             if let Err(e) = std::fs::rename(&incoming, &live) {
@@ -133,16 +143,23 @@ pub fn restore(app: &AppHandle, src: &Path) -> Result<(), String> {
             Err(e) => {
                 // Back onto the database that was there before. Leaving the
                 // empty stand-in in place made every later command fail with
-                // "no such table" until a restart.
-                if let Ok(conn) = db::open(&live) {
-                    *guard = conn;
+                // "no such table" until a restart. Never open a missing file:
+                // that would create an empty library in its place.
+                if !live.exists() && keep_old.exists() {
+                    let _ = std::fs::rename(&keep_old, &live);
+                }
+                if live.exists() {
+                    if let Ok(conn) = db::open(&live) {
+                        *guard = conn;
+                    }
                 }
                 let _ = std::fs::remove_file(&incoming);
                 tracing::error!("restore failed, kept the current library: {e}");
                 return Err(e);
             }
         }
-    }
+        Ok(())
+    })?;
     tracing::info!(from = %src.display(), "backup restored");
 
     // Posters: overwrite whatever the zip has; leave other cached images alone.
@@ -162,6 +179,23 @@ pub fn restore(app: &AppHandle, src: &Path) -> Result<(), String> {
             let _ = std::io::copy(&mut entry, &mut out);
         }
     }
+
+    // Poster paths are stored whole; a backup made under another Windows user
+    // or drive points at a folder that does not exist here, and those posters
+    // never showed. Point them at this machine's folder.
+    if let Ok(conn) = state.db.lock() {
+        let rows: Vec<(i64, String)> = conn
+            .prepare("SELECT id, poster_path FROM media_items WHERE poster_path IS NOT NULL")
+            .and_then(|mut s| s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect())
+            .unwrap_or_default();
+        for (id, old) in rows {
+            if let Some(name) = Path::new(&old).file_name() {
+                let here = posters_dir.join(name);
+                let _ = conn.execute("UPDATE media_items SET poster_path = ?2 WHERE id = ?1", rusqlite::params![id, here.to_string_lossy()]);
+            }
+        }
+    }
+    crate::tmdb::migrate_image_names(app);
 
     let _ = app.emit("library-restored", ());
     tray::rebuild(app);

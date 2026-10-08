@@ -35,7 +35,7 @@ defineExpose({ reload: load });
 
 <template>
   <div class="space-y-8">
-    <h1 class="text-2xl font-semibold tracking-tight">Statistics</h1>
+    <h1 class="text-[2.6rem] font-black leading-none tracking-[-0.04em]">Statistics</h1>
     <div v-if="!s" class="grid grid-cols-5 gap-3"><Skeleton v-for="i in 5" :key="i" class="h-20 rounded-xl" /></div>
     <template v-else>
       <div class="grid grid-cols-2 gap-3 md:grid-cols-5">

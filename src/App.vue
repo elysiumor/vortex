@@ -1,12 +1,14 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { Toaster, toast } from "vue-sonner";
-import { Home, Film, Tv, Layers, History, Copy, BarChart3, Settings, Search, Sparkles, X, Play, Trash2, Download } from "@lucide/vue";
+import { History, Copy, BarChart3, Settings, Search, Sparkles, X, Play, Trash2, ChevronDown, Sun, Moon } from "@lucide/vue";
 import { api, type SmartList } from "./lib/api";
 import { hms } from "./lib/format";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { applyTheme } from "./lib/theme";
 import HomeView from "./components/HomeView.vue";
 import LibraryView from "./components/LibraryView.vue";
 import SeriesView from "./components/SeriesView.vue";
@@ -17,6 +19,7 @@ import DuplicatesView from "./components/DuplicatesView.vue";
 import CollectionsView from "./components/CollectionsView.vue";
 import StatsView from "./components/StatsView.vue";
 import DownloadsView from "./components/DownloadsView.vue";
+import QuickSearch from "./components/QuickSearch.vue";
 
 type Page = "home" | "movies" | "series" | "collections" | "history" | "duplicates" | "stats" | "downloads" | "settings" | "smart";
 const page = ref<Page>("home");
@@ -37,16 +40,49 @@ const collectionsRef = ref<InstanceType<typeof CollectionsView>>();
 const statsRef = ref<InstanceType<typeof StatsView>>();
 const downloadsRef = ref<InstanceType<typeof DownloadsView>>();
 
-const nav = computed(() => [
-  { id: "home" as Page, label: "Home", icon: Home },
-  { id: "movies" as Page, label: "Movies", icon: Film },
-  { id: "series" as Page, label: "TV Series", icon: Tv },
-  { id: "collections" as Page, label: "Collections", icon: Layers },
+const nav: { id: Page; label: string }[] = [
+  { id: "home", label: "Home" },
+  { id: "movies", label: "Movies" },
+  { id: "series", label: "Series" },
+  { id: "collections", label: "Collections" },
+  { id: "downloads", label: "Downloads" },
+];
+const more = computed(() => [
   { id: "history" as Page, label: "History", icon: History },
   { id: "stats" as Page, label: "Statistics", icon: BarChart3 },
-  { id: "downloads" as Page, label: "Downloads", icon: Download },
   { id: "duplicates" as Page, label: "Duplicates", icon: Copy, count: dupCount.value },
 ]);
+const inMore = computed(() => !openId.value && !search.value && (more.value.some((m) => m.id === page.value) || page.value === "smart"));
+
+// Pages that open on a full-width picture slide under a transparent bar;
+// the bar turns frosted once the page scrolls.
+const scroller = ref<HTMLElement>();
+const scrolled = ref(false);
+const heroPage = computed(() => !search.value.trim() && (openId.value !== null || page.value === "home"));
+function onScroll() { scrolled.value = (scroller.value?.scrollTop ?? 0) > 24; }
+watch([page, openId, activeSmart], () => { scroller.value?.scrollTo({ top: 0 }); scrolled.value = false; });
+
+// ---- Ctrl+K palette ----
+const quickOpen = ref(false);
+async function rescanFromPalette() {
+  toast("Rescanning libraries…");
+  try {
+    const s = await api.scanLibraries();
+    toast.success(`Scan done: ${s.files_seen} files, ${s.added} added, ${s.removed} removed`);
+  } catch (e) {
+    toast.error(String(e));
+  }
+  refreshAll();
+}
+
+const dark = ref(document.documentElement.classList.contains("dark"));
+function toggleTheme() {
+  dark.value = !dark.value;
+  applyTheme(dark.value ? "dark" : "light");
+}
+// Settings can change the theme too; follow it.
+new MutationObserver(() => { dark.value = document.documentElement.classList.contains("dark"); })
+  .observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
 
 function go(p: Page, smart: SmartList | null = null) {
   page.value = p;
@@ -157,8 +193,7 @@ function onKey(e: KeyboardEvent) {
   const inField = ["INPUT", "TEXTAREA", "SELECT"].includes((e.target as HTMLElement)?.tagName);
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
     e.preventDefault();
-    el?.focus();
-    el?.select();
+    quickOpen.value = !quickOpen.value;
   } else if (e.key === "/" && !inField) {
     e.preventDefault();
     el?.focus();
@@ -203,6 +238,7 @@ onMounted(async () => {
     refreshAll();
   }));
   unlisteners.push(await api.onLibraryRestored(() => { openId.value = null; refreshAll(); }));
+  unlisteners.push(await api.onLibraryChanged(() => refreshAll()));
   unlisteners.push(await api.onDurationsDone((p) => { if (p.found > 0) refreshAll(); }));
   unlisteners.push(await api.onPostersDone(() => refreshAll()));
   // magnet: links clicked in a browser: jump to Downloads and stream.
@@ -227,54 +263,77 @@ onUnmounted(() => {
 
 <template>
   <TooltipProvider :delay-duration="300">
-    <div class="flex h-full">
-      <aside class="flex w-56 shrink-0 flex-col gap-1 border-r border-sidebar-border bg-sidebar p-3">
-        <div class="flex items-center gap-2 px-2 pb-3 pt-1">
-          <div class="grid size-7 place-items-center rounded-lg bg-primary text-primary-foreground"><Play class="size-4 fill-current" /></div>
-          <span class="text-base font-semibold tracking-tight">Vortex</span>
-        </div>
+    <div class="relative flex h-full flex-col">
+      <!-- Top bar: transparent over a hero picture, frosted once the page scrolls. -->
+      <header class="absolute left-0 right-[10px] top-0 z-40 transition-[background-color,box-shadow,backdrop-filter] duration-300"
+              :class="scrolled || !heroPage ? 'glass shadow-[0_1px_0_var(--border)]' : 'bg-gradient-to-b from-background/80 via-background/30 to-transparent'">
+        <div class="mx-auto flex h-16 max-w-[1920px] items-center gap-4 px-6 xl:gap-8 xl:px-10">
+          <button class="group flex items-center gap-2.5" title="Home" @click="go('home')">
+            <span class="grid size-8 place-items-center rounded-[10px] bg-brand shadow-[0_6px_18px_-6px_rgb(179_234_63/0.8)] transition-transform group-hover:rotate-[-8deg]">
+              <Play class="ml-0.5 size-4 fill-current" />
+            </span>
+            <span class="text-brand text-[1.35rem] font-black tracking-[-0.04em]">VORTEX</span>
+          </button>
 
-        <div class="relative mb-2">
-          <Search class="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-          <Input ref="searchBox" v-model="search" placeholder="Search" class="h-9 pl-8 pr-12 bg-background/60" />
-          <kbd class="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 rounded border bg-muted px-1.5 text-[10px] text-muted-foreground">Ctrl K</kbd>
-        </div>
-
-        <button v-for="n in nav" :key="n.id"
-                class="flex h-9 items-center gap-2.5 rounded-md px-2.5 text-sm transition-colors"
-                :class="page === n.id && !openId && !search ? 'bg-primary/12 text-primary font-medium' : 'text-sidebar-foreground hover:bg-accent'"
-                @click="go(n.id)">
-          <component :is="n.icon" class="size-4" />
-          <span class="flex-1 text-left">{{ n.label }}</span>
-          <span v-if="n.count" class="rounded-full bg-muted px-1.5 text-[11px] text-muted-foreground">{{ n.count }}</span>
-        </button>
-
-        <template v-if="smartLists.length">
-          <div class="mt-3 px-2.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">Smart lists</div>
-          <div v-for="l in smartLists" :key="l.id" class="group flex items-center">
-            <button class="flex h-8 flex-1 items-center gap-2.5 rounded-md px-2.5 text-sm transition-colors"
-                    :class="activeSmart?.id === l.id ? 'bg-primary/12 text-primary font-medium' : 'text-sidebar-foreground hover:bg-accent'"
-                    @click="go('smart', l)">
-              <Sparkles class="size-3.5" /><span class="flex-1 truncate text-left">{{ l.name }}</span>
+          <nav class="flex items-center gap-1">
+            <button v-for="n in nav" :key="n.id"
+                    class="relative rounded-full px-3 py-1.5 text-sm font-medium transition-colors xl:px-3.5"
+                    :class="page === n.id && !openId && !search ? 'text-foreground' : 'text-foreground/60 hover:text-foreground'"
+                    @click="go(n.id)">
+              {{ n.label }}
+              <span v-if="page === n.id && !openId && !search" class="absolute inset-x-3.5 -bottom-[3px] h-[3px] rounded-full bg-brand"></span>
             </button>
-            <Button variant="ghost" size="icon-xs" class="opacity-0 group-hover:opacity-100 text-muted-foreground" title="Delete smart list" @click="removeSmartList(l)"><Trash2 /></Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger as-child>
+                <button class="relative flex items-center gap-1 rounded-full px-3 py-1.5 text-sm font-medium transition-colors xl:px-3.5"
+                        :class="inMore ? 'text-foreground' : 'text-foreground/60 hover:text-foreground'">
+                  More <ChevronDown class="size-3.5" />
+                  <span v-if="dupCount" class="ml-0.5 rounded-full bg-primary/15 px-1.5 text-[10px] font-semibold text-primary">{{ dupCount }}</span>
+                  <span v-if="inMore" class="absolute inset-x-3.5 -bottom-[3px] h-[3px] rounded-full bg-brand"></span>
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" class="min-w-52">
+                <DropdownMenuItem v-for="m in more" :key="m.id" @select="go(m.id)">
+                  <component :is="m.icon" /> <span class="flex-1">{{ m.label }}</span>
+                  <span v-if="m.count" class="rounded-full bg-muted px-1.5 text-[11px] text-muted-foreground">{{ m.count }}</span>
+                </DropdownMenuItem>
+                <template v-if="smartLists.length">
+                  <DropdownMenuSeparator />
+                  <DropdownMenuLabel class="text-xs text-muted-foreground">Smart lists</DropdownMenuLabel>
+                  <DropdownMenuItem v-for="l in smartLists" :key="l.id" class="group" @select="go('smart', l)">
+                    <Sparkles /> <span class="flex-1 truncate">{{ l.name }}</span>
+                    <button class="rounded p-0.5 opacity-0 hover:text-destructive group-hover:opacity-100" title="Delete smart list" @click.stop="removeSmartList(l)"><Trash2 class="size-3.5" /></button>
+                  </DropdownMenuItem>
+                </template>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </nav>
+
+          <div class="flex-1"></div>
+
+          <div class="relative min-w-0 shrink">
+            <Search class="pointer-events-none absolute left-3.5 top-1/2 size-4 -translate-y-1/2 text-foreground/50" />
+            <Input ref="searchBox" v-model="search" placeholder="Titles, people, episodes"
+                   class="h-10 w-48 max-w-full rounded-full border-foreground/10 bg-foreground/[0.06] pl-10 pr-14 shadow-none backdrop-blur transition-[width,background-color] duration-300 placeholder:text-foreground/45 focus-visible:w-60 focus-visible:bg-background/80 xl:w-64 xl:focus-visible:w-80" />
+            <button class="absolute right-2 top-1/2 -translate-y-1/2 rounded-md border border-foreground/10 px-1.5 text-[10px] text-foreground/45 hover:text-foreground" title="Quick search" @click="quickOpen = true">Ctrl K</button>
           </div>
-        </template>
+          <div class="flex items-center gap-1">
+            <Button variant="ghost" size="icon" class="rounded-full" :title="dark ? 'Light mode' : 'Dark mode'" @click="toggleTheme">
+              <Sun v-if="dark" /><Moon v-else />
+            </Button>
+            <Button variant="ghost" size="icon" class="rounded-full" :class="{ 'bg-accent': page === 'settings' && !openId && !search }" title="Settings" @click="go('settings')">
+              <Settings />
+            </Button>
+          </div>
+        </div>
+      </header>
 
-        <div class="flex-1"></div>
-        <button class="flex h-9 items-center gap-2.5 rounded-md px-2.5 text-sm transition-colors"
-                :class="page === 'settings' ? 'bg-primary/12 text-primary font-medium' : 'text-sidebar-foreground hover:bg-accent'"
-                @click="go('settings')">
-          <Settings class="size-4" /><span>Settings</span>
-        </button>
-      </aside>
-
-      <main class="flex-1 overflow-y-auto">
-        <div class="mx-auto max-w-[1600px] p-6">
-          <SearchView v-if="search.trim()" :query="search" @open="openItem" />
-          <SeriesView v-else-if="openId !== null" ref="detail" :id="openId" @back="back" />
-          <HomeView v-else-if="page === 'home'" ref="home" @open="openItem" @go="go" />
-          <LibraryView v-else-if="page === 'movies'" ref="library" kind="movie" @open="openItem" @save-smart="addSmartList" />
+      <main ref="scroller" class="flex-1 overflow-y-auto overflow-x-hidden" @scroll.passive="onScroll">
+        <SearchView v-if="search.trim()" class="mx-auto max-w-[1700px] px-10 pb-12 pt-24" :query="search" @open="openItem" />
+        <SeriesView v-else-if="openId !== null" ref="detail" :id="openId" @back="back" />
+        <HomeView v-else-if="page === 'home'" ref="home" @open="openItem" @go="go" />
+        <div v-else class="mx-auto max-w-[1700px] px-10 pb-12 pt-24">
+          <LibraryView v-if="page === 'movies'" ref="library" kind="movie" @open="openItem" @save-smart="addSmartList" />
           <LibraryView v-else-if="page === 'series'" ref="library" kind="series" @open="openItem" @save-smart="addSmartList" />
           <LibraryView v-else-if="page === 'smart' && activeSmart" ref="library" :kind="activeSmart.kind === 'all' ? undefined : activeSmart.kind" :smart="activeSmart" @open="openItem" @save-smart="addSmartList" />
           <CollectionsView v-else-if="page === 'collections'" ref="collectionsRef" @open="openItem" />
@@ -286,15 +345,17 @@ onUnmounted(() => {
         </div>
       </main>
 
-      <Toaster position="bottom-right" :theme="'system'" rich-colors close-button />
+      <QuickSearch v-model:open="quickOpen" @open-item="openItem" @go="go" @toggle-theme="toggleTheme" @rescan="rescanFromPalette" @search="(q) => (search = q)" />
 
-      <div v-if="upNext" class="fixed bottom-5 right-5 z-50 flex items-center gap-3 rounded-xl border border-primary/40 bg-popover p-3 pl-4 shadow-2xl animate-in slide-in-from-bottom-4">
+      <Toaster position="bottom-right" :theme="dark ? 'dark' : 'light'" rich-colors close-button />
+
+      <div v-if="upNext" class="glass fixed bottom-6 right-6 z-50 flex items-center gap-3 rounded-2xl border border-primary/30 p-3 pl-4 shadow-2xl animate-in slide-in-from-bottom-4">
         <div class="max-w-xs">
           <div class="text-xs text-muted-foreground">Up next in {{ upNext.seconds }}s</div>
-          <div class="truncate font-medium">{{ upNext.label }}</div>
+          <div class="truncate font-semibold">{{ upNext.label }}</div>
         </div>
-        <Button size="sm" @click="playUpNext"><Play class="fill-current" /> Play now</Button>
-        <Button size="icon-sm" variant="ghost" @click="cancelUpNext"><X /></Button>
+        <Button variant="brand" size="sm" class="rounded-full" @click="playUpNext"><Play class="fill-current" /> Play now</Button>
+        <Button size="icon-sm" variant="ghost" class="rounded-full" @click="cancelUpNext"><X /></Button>
       </div>
     </div>
   </TooltipProvider>

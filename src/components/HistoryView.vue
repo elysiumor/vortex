@@ -45,7 +45,7 @@ defineExpose({ reload: load });
 <template>
   <div class="space-y-6">
     <div class="flex items-center gap-3">
-      <h1 class="flex-1 text-2xl font-semibold tracking-tight">History</h1>
+      <h1 class="flex-1 text-[2.6rem] font-black leading-none tracking-[-0.04em]">History</h1>
       <Button variant="outline" size="sm" v-if="entries.length" @click="confirmClear = true"><Trash2 /> Clear history</Button>
     </div>
     <div class="grid grid-cols-2 gap-3 md:grid-cols-4" v-if="stats">

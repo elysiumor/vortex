@@ -67,7 +67,7 @@ static JUNK: LazyLock<Regex> = LazyLock::new(|| {
 /// Web (2006)" must keep "Web", "A Complete Unknown (2024)" its "Complete".
 static TECH: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)\b(2160p|1080p|1080i|720p|480p|4k|hdr10|x264|x265|h\.?264|h\.?265|hevc|xvid|divx|10bit|8bit|bluray|blu-ray|bdrip|brrip|webrip|web-dl|webdl|hdrip|dvdrip|hdtv|pdtv|hdcam|remux|aac|ac3|eac3|dd5\.?1|ddp5\.?1|truehd|yify|yts|rarbg|eztv|ettv|amzn|dsnp|hmax|atvp)\b",
+        r"(?i)\b(2160p|1080p|1080i|720p|480p|4k|hdr10|x264|x265|h\.?264|h\.?265|hevc|xvid|divx|10bit|8bit|bluray|blu-ray|bdrip|brrip|webrip|web-dl|webdl|hdrip|dvdrip|hdtv|pdtv|hdcam|remux|aac|ac3|eac3|dd5\.?1|ddp5\.?1|truehd|yify|yts|rarbg|eztv|ettv|amzn|dsnp|hmax|atvp|the\s+complete\s+series|complete\s+series|complete\s+collection|extended\s+(?:edition|cut)|theatrical\s+cut|director'?s\s+cut|directors\s+cut|unrated|remastered)\b",
     )
     .unwrap()
 });
@@ -163,11 +163,13 @@ pub fn episode_code(stem: &str) -> Option<(i32, i32, Option<i32>)> {
     if let Some(c) = SEASON_EP.captures(stem) {
         let season = parse_i32(&c[1])?;
         let first = parse_i32(&c[2])?;
-        // Every number after the first E: "S01E01E02", "S01E01-E03".
+        // Further episodes are numbers after an E or a dash: "S01E01E02",
+        // "S01E01-E03", "S01E01-03". Bare dotted numbers that follow
+        // ("S01E01.1.23.45") are something else.
         let whole = c.get(0)?.as_str();
         let after = &whole[c.get(2)?.end() - c.get(0)?.start()..];
-        static NUM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d{1,3}").unwrap());
-        let last = NUM.find_iter(after).filter_map(|m| parse_i32(m.as_str())).max().filter(|l| *l > first);
+        static MORE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)(?:-\s*E?|E)(\d{1,3})").unwrap());
+        let last = MORE.captures_iter(after).filter_map(|m| parse_i32(&m[1])).max().filter(|l| *l > first);
         return Some((season, first, last));
     }
     for re in [&*X_EP, &*LONG_EP] {
@@ -183,18 +185,41 @@ pub fn year_in(name: &str) -> Option<i32> {
     find_year(name).map(|(y, _)| y)
 }
 
+/// The release year and where it starts. A year in brackets wins ("Wonder
+/// Woman 1984 (2020)"); otherwise the last one inside the name, since a year
+/// that belongs to the title comes before the release year
+/// ("Blade.Runner.2049.2017.1080p"). A name that starts with a year keeps it
+/// as the title ("2012 (2009)", "1917"). The end of a range ("1999-2007") is
+/// not a release year.
 fn find_year(s: &str) -> Option<(i32, usize)> {
-    // Prefer a year that is not at the very start (e.g. "2012 (2009)").
     let mut first = None;
-    for cap in YEAR.captures_iter(s) {
+    let mut inner = None;
+    let mut bracketed = None;
+    // Each search starts right after the previous year, not after its match:
+    // the match takes the separator that follows ("2049."), which is also the
+    // separator in front of the next year ("2049.2017").
+    let mut at = 0;
+    while let Some(cap) = YEAR.captures_at(s, at) {
         let m = cap.get(1).unwrap();
-        let y: i32 = m.as_str().parse().ok()?;
+        at = m.end();
+        let Ok(y) = m.as_str().parse::<i32>() else { continue };
+        let before = &s[..m.start()];
+        let range_end = before.len() >= 5
+            && before.ends_with('-')
+            && before[before.len() - 5..before.len() - 1].chars().all(|c| c.is_ascii_digit());
+        if range_end {
+            continue;
+        }
+        let in_brackets = before.ends_with(['(', '[']) && s[m.end()..].starts_with([')', ']']);
+        if in_brackets {
+            bracketed = Some((y, m.start()));
+        }
         if m.start() > 0 {
-            return Some((y, m.start()));
+            inner = Some((y, m.start()));
         }
         first.get_or_insert((y, m.start()));
     }
-    first
+    bracketed.or(inner).or(first)
 }
 
 fn parse_i32(s: &str) -> Option<i32> {
@@ -300,9 +325,12 @@ fn parse_inner(path: &Path, library_root: &Path) -> Parsed {
         return Parsed { kind: Kind::Series, title, year, season: Some(season), episode: ep_from_name, extra: false };
     }
     if let (Some(episode), Some(folder)) = (ep_from_name, series_folder) {
-        // "Show Name/Show Name - 05.mkv" (common for anime).
+        // "Show Name/Show Name - 05.mkv" (common for anime). A season in the
+        // name ("Show S2 - 05") counts; it used to become S1E05 and collide
+        // with the real first-season episode.
         let (title, year) = folder_title(folder);
-        return Parsed { kind: Kind::Series, title, year, season: Some(1), episode: Some(episode), extra: false };
+        let season = season_from_dir(&stem).unwrap_or(1);
+        return Parsed { kind: Kind::Series, title, year, season: Some(season), episode: Some(episode), extra: false };
     }
 
     // 3. Movie.
@@ -487,12 +515,33 @@ mod tests {
         assert_eq!(p("Movies/Some.Film.1080p.WEB-DL.x264.mkv").title, "Some Film");
     }
 
+    /// A year that belongs to the title must not be taken for the release
+    /// year: the films below were filed as the earlier film of the same name.
+    #[test]
+    fn release_year_not_the_year_in_the_title() {
+        for (rel, title, year) in [
+            ("Movies/Wonder Woman 1984 (2020).mkv", "Wonder Woman 1984", 2020),
+            ("Movies/Blade.Runner.2049.2017.1080p.BluRay.mkv", "Blade Runner 2049", 2017),
+            ("Movies/1917 (2019).mkv", "1917", 2019),
+            ("Movies/2001.A.Space.Odyssey.1968.1080p.mkv", "2001 A Space Odyssey", 1968),
+            ("Movies/The Lord of the Rings (Extended Edition) (2001).mkv", "The Lord of the Rings", 2001),
+        ] {
+            let r = p(rel);
+            assert_eq!((r.title.as_str(), r.year), (title, Some(year)), "{rel}");
+        }
+        assert_eq!(folder_title_of("The.Sopranos.Complete.Series.1999-2007.1080p"), ("The Sopranos".to_string(), Some(1999)));
+    }
+
     #[test]
     fn episode_codes_and_ranges() {
         assert_eq!(episode_code("Show.S01E05.1080p.WEB"), Some((1, 5, None)));
         assert_eq!(episode_code("Show S02E01-E02 720p"), Some((2, 1, Some(2))));
         assert_eq!(episode_code("Show.S02E01E02E03"), Some((2, 1, Some(3))));
         assert_eq!(episode_code("Show 3x07"), Some((3, 7, None)));
+        assert_eq!(episode_code("Chernobyl.S01E01.1.23.45"), Some((1, 1, None)), "dotted numbers are not more episodes");
+        let r = p("Anime/Oshi no Ko/[SubsPlease] Oshi no Ko S2 - 05 (1080p).mkv");
+        assert_eq!((r.season, r.episode), (Some(2), Some(5)), "the season in the name counts");
+        assert_eq!(episode_code("Show S01E01-03"), Some((1, 1, Some(3))));
         assert_eq!(episode_code("[SubsPlease] Show - 27 (1080p) [ABCD1234]"), None, "anime numbering names no season");
     }
 

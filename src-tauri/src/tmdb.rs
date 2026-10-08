@@ -166,57 +166,92 @@ struct SeasonEpisode {
     vote_average: Option<f64>,
 }
 
+/// One season's episode list: from the cache, unless the cache lacks an
+/// episode the library has (a show still airing) or `force` is set. Fetched
+/// lists are cached. None: TMDb has no such season.
+fn season_episodes(app: &AppHandle, key: &str, tmdb_id: i64, season: i32, need: &[i32], force: bool) -> Result<Option<Vec<SeasonEpisode>>, String> {
+    let state = app.state::<AppState>();
+    let cached: Option<Vec<SeasonEpisode>> = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        db::get_season_json(&conn, tmdb_id, season)
+            .map_err(|e| e.to_string())?
+            .and_then(|j| serde_json::from_str::<SeasonResponse>(&j).ok())
+            .map(|b| b.episodes)
+    };
+    if let Some(eps) = &cached {
+        let complete = need.iter().all(|n| eps.iter().any(|e| e.episode_number == *n));
+        if complete && !force {
+            return Ok(cached);
+        }
+    }
+    if key.trim().is_empty() {
+        // Offline: what is cached beats nothing.
+        return match cached {
+            Some(eps) => Ok(Some(eps)),
+            None => Err("Add your TMDB API key in Settings first".into()),
+        };
+    }
+    let req = client().get(format!("{API}/tv/{tmdb_id}/season/{season}")).query(&[("language", LANG)]);
+    let resp = auth(req, key).send().map_err(|e| format!("TMDB request failed: {e}"))?;
+    if resp.status().as_u16() == 404 {
+        return Ok(None); // season numbering differs from TMDB
+    }
+    if !resp.status().is_success() {
+        return Err(format!("TMDB returned HTTP {}", resp.status()));
+    }
+    let json = resp.text().map_err(|e| e.to_string())?;
+    let body: SeasonResponse = serde_json::from_str(&json).map_err(|e| format!("bad TMDB response: {e}"))?;
+    if let Ok(conn) = state.db.lock() {
+        let _ = db::set_season_json(&conn, tmdb_id, season, &json);
+    }
+    std::thread::sleep(Duration::from_millis(100)); // stay well under TMDB's rate limit
+    Ok(Some(body.episodes))
+}
+
+fn tmdb_key(app: &AppHandle) -> Result<String, String> {
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    Ok(db::get_setting(&conn, "tmdb_key").map_err(|e| e.to_string())?.unwrap_or_default())
+}
+
 /// Episode names of one TMDb season, by episode number. Used when renaming
 /// anime numbered straight through, whose later episodes never matched a
 /// season in `fetch_episode_titles`.
 pub fn season_names(app: &AppHandle, tmdb_id: i64, season: i32) -> Result<std::collections::HashMap<i32, String>, String> {
-    let key = {
-        let state = app.state::<AppState>();
-        let conn = state.db.lock().map_err(|e| e.to_string())?;
-        db::get_setting(&conn, "tmdb_key").map_err(|e| e.to_string())?.unwrap_or_default()
-    };
-    if key.trim().is_empty() {
-        return Err("Add your TMDB API key in Settings first".into());
-    }
-    let req = client().get(format!("{API}/tv/{tmdb_id}/season/{season}")).query(&[("language", LANG)]);
-    let resp = auth(req, &key).send().map_err(|e| format!("TMDB request failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("TMDB returned HTTP {}", resp.status()));
-    }
-    let body: SeasonResponse = resp.json().map_err(|e| format!("bad TMDB response: {e}"))?;
-    Ok(body.episodes.into_iter().filter_map(|e| Some((e.episode_number, e.name.filter(|n| !n.trim().is_empty())?))).collect())
+    let key = tmdb_key(app)?;
+    let eps = season_episodes(app, &key, tmdb_id, season, &[], false)?.unwrap_or_default();
+    Ok(eps.into_iter().filter_map(|e| Some((e.episode_number, e.name.filter(|n| !n.trim().is_empty())?))).collect())
 }
 
-/// Fetch episode names for every season present in the library for this
-/// series. Returns how many episodes were updated.
-pub fn fetch_episode_titles(app: &AppHandle, media_item_id: i64) -> Result<usize, String> {
+/// Episode names for every season present in the library for this series,
+/// from the cache where it has them. `force` (the Refresh button) asks TMDb
+/// again. Returns how many episodes were updated.
+pub fn fetch_episode_titles(app: &AppHandle, media_item_id: i64, force: bool) -> Result<usize, String> {
     let state = app.state::<AppState>();
-    let (key, tmdb_id, seasons) = {
+    let (tmdb_id, seasons) = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
-        let key = db::get_setting(&conn, "tmdb_key").map_err(|e| e.to_string())?.unwrap_or_default();
         let item = db::get_media_item(&conn, media_item_id).map_err(|e| e.to_string())?.ok_or("item not found")?;
         if item.kind != "series" {
             return Ok(0);
         }
         let tmdb_id = item.tmdb_id.ok_or("Match this series to TMDB first (Fix match)")?;
-        (key, tmdb_id, db::seasons_for_item(&conn, media_item_id).map_err(|e| e.to_string())?)
+        let mut seasons: Vec<(i32, Vec<i32>)> = Vec::new();
+        for season in db::seasons_for_item(&conn, media_item_id).map_err(|e| e.to_string())? {
+            let mut stmt = conn
+                .prepare("SELECT episode FROM episodes WHERE media_item_id = ?1 AND season = ?2 AND episode IS NOT NULL")
+                .map_err(|e| e.to_string())?;
+            let eps: Vec<i32> =
+                stmt.query_map(rusqlite::params![media_item_id, season], |r| r.get(0)).map_err(|e| e.to_string())?.flatten().collect();
+            seasons.push((season, eps));
+        }
+        (tmdb_id, seasons)
     };
-    if key.trim().is_empty() {
-        return Err("Add your TMDB API key in Settings first".into());
-    }
+    let key = tmdb_key(app)?;
     let mut updated = 0;
-    for season in seasons {
-        let req = client().get(format!("{API}/tv/{tmdb_id}/season/{season}")).query(&[("language", LANG)]);
-        let resp = auth(req, &key).send().map_err(|e| format!("TMDB request failed: {e}"))?;
-        if resp.status().as_u16() == 404 {
-            continue; // season numbering differs from TMDB; skip it
-        }
-        if !resp.status().is_success() {
-            return Err(format!("TMDB returned HTTP {}", resp.status()));
-        }
-        let body: SeasonResponse = resp.json().map_err(|e| format!("bad TMDB response: {e}"))?;
+    for (season, need) in seasons {
+        let Some(eps) = season_episodes(app, &key, tmdb_id, season, &need, force)? else { continue };
         let conn = state.db.lock().map_err(|e| e.to_string())?;
-        for ep in body.episodes {
+        for ep in eps {
             updated += db::set_episode_meta(
                 &conn,
                 media_item_id,
@@ -230,7 +265,6 @@ pub fn fetch_episode_titles(app: &AppHandle, media_item_id: i64) -> Result<usize
             )
             .map_err(|e| e.to_string())?;
         }
-        std::thread::sleep(Duration::from_millis(100));
     }
     Ok(updated)
 }
@@ -518,8 +552,19 @@ fn normalize(kind: &str, raw: RawDetails, backdrop_local: Option<String>, fetche
     }
 }
 
-fn backdrop_file(app: &AppHandle, media_item_id: i64, raw_path: Option<&str>) -> Option<String> {
-    let dest = posters_dir(app).ok()?.join(format!("{media_item_id}_backdrop.jpg"));
+/// Images are stored by TMDb id, not by library title: every title matched to
+/// the same film shares them, they survive the title being removed with its
+/// folder, and a reused title id can never show another film's picture.
+fn poster_path_for(dir: &Path, kind: &str, tmdb_id: i64) -> PathBuf {
+    dir.join(format!("{kind}-{tmdb_id}.jpg"))
+}
+
+fn backdrop_path_for(dir: &Path, kind: &str, tmdb_id: i64) -> PathBuf {
+    dir.join(format!("{kind}-{tmdb_id}-backdrop.jpg"))
+}
+
+fn backdrop_file(app: &AppHandle, kind: &str, tmdb_id: i64, raw_path: Option<&str>) -> Option<String> {
+    let dest = backdrop_path_for(&posters_dir(app).ok()?, kind, tmdb_id);
     if dest.exists() {
         return Some(dest.to_string_lossy().to_string());
     }
@@ -536,8 +581,12 @@ fn backdrop_file(app: &AppHandle, media_item_id: i64, raw_path: Option<&str>) ->
     Some(dest.to_string_lossy().to_string())
 }
 
+/// How long cached details are served before they are fetched again on
+/// their own. Refresh on the title page always fetches.
+const DETAILS_MAX_AGE_DAYS: i64 = 90;
+
 /// Full details for the detail page. Served from the local cache unless
-/// `refresh` is set or the cache is older than 30 days.
+/// `refresh` is set or the cache is older than `DETAILS_MAX_AGE_DAYS`.
 pub fn get_details(app: &AppHandle, media_item_id: i64, refresh: bool) -> Result<Option<Details>, String> {
     let state = app.state::<AppState>();
     let (key, kind, tmdb_id, cached) = {
@@ -545,12 +594,12 @@ pub fn get_details(app: &AppHandle, media_item_id: i64, refresh: bool) -> Result
         let item = db::get_media_item(&conn, media_item_id).map_err(|e| e.to_string())?.ok_or("item not found")?;
         let Some(tmdb_id) = item.tmdb_id else { return Ok(None) };
         let key = db::get_setting(&conn, "tmdb_key").map_err(|e| e.to_string())?.unwrap_or_default();
-        let cached = db::get_details_json(&conn, media_item_id).map_err(|e| e.to_string())?;
+        let cached = db::get_details_json(&conn, &item.kind, tmdb_id).map_err(|e| e.to_string())?;
         (key, item.kind, tmdb_id, cached)
     };
 
     let stale = |fetched_at: &str| -> bool {
-        // fetched_at is "YYYY-MM-DD HH:MM:SS" UTC; compare on the date part, 30 days.
+        // fetched_at is "YYYY-MM-DD HH:MM:SS" UTC; compare on the date part.
         let days = |s: &str| -> Option<i64> {
             let d: Vec<i64> = s.get(..10)?.split('-').filter_map(|p| p.parse().ok()).collect();
             if d.len() != 3 { return None; }
@@ -559,23 +608,23 @@ pub fn get_details(app: &AppHandle, media_item_id: i64, refresh: bool) -> Result
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let today = chrono_free_date(now);
         match (days(fetched_at), days(&today)) {
-            (Some(a), Some(b)) => b - a > 30,
+            (Some(a), Some(b)) => b - a > DETAILS_MAX_AGE_DAYS,
             _ => true,
         }
     };
 
-    if let (false, Some((cached_id, json, fetched_at))) = (refresh, &cached) {
-        if *cached_id == tmdb_id && !stale(fetched_at) {
+    if let (false, Some((json, fetched_at))) = (refresh, &cached) {
+        if !stale(fetched_at) {
             let raw: RawDetails = serde_json::from_str(json).map_err(|e| e.to_string())?;
-            let backdrop = backdrop_file(app, media_item_id, raw.backdrop_path.as_deref());
+            let backdrop = backdrop_file(app, &kind, tmdb_id, raw.backdrop_path.as_deref());
             return Ok(Some(normalize(&kind, raw, backdrop, fetched_at.clone())));
         }
     }
     if key.trim().is_empty() {
         // Offline fallback: serve stale cache rather than nothing.
-        if let Some((_, json, fetched_at)) = cached {
+        if let Some((json, fetched_at)) = cached {
             let raw: RawDetails = serde_json::from_str(&json).map_err(|e| e.to_string())?;
-            let backdrop = backdrop_file(app, media_item_id, raw.backdrop_path.as_deref());
+            let backdrop = backdrop_file(app, &kind, tmdb_id, raw.backdrop_path.as_deref());
             return Ok(Some(normalize(&kind, raw, backdrop, fetched_at)));
         }
         return Err("Add your TMDB API key in Settings first".into());
@@ -595,26 +644,16 @@ pub fn get_details(app: &AppHandle, media_item_id: i64, refresh: bool) -> Result
     let raw: RawDetails = serde_json::from_str(&json).map_err(|e| format!("bad TMDB response: {e}"))?;
     {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
-        db::set_details_json(&conn, media_item_id, tmdb_id, &json).map_err(|e| e.to_string())?;
-        let rating = raw.vote_average.filter(|v| *v > 0.0).map(|v| (v * 10.0).round() / 10.0);
-        db::set_item_rating(&conn, media_item_id, rating).map_err(|e| e.to_string())?;
-        let genres: Vec<String> = raw.genres.iter().filter_map(|g| g.name.clone()).filter(|n| !n.is_empty()).collect();
-        db::set_item_genres(&conn, media_item_id, (!genres.is_empty()).then(|| genres.join(", ")).as_deref())
-            .map_err(|e| e.to_string())?;
-        if let Some(c) = &raw.belongs_to_collection {
-            if let (Some(cid), Some(name)) = (c.id, c.name.clone()) {
-                let url = c.poster_path.as_ref().map(|p| format!("{IMG}{p}"));
-                let _ = db::attach_tmdb_collection(&conn, media_item_id, cid, &name, url.as_deref());
-            }
-        }
+        db::set_details_json(&conn, &kind, tmdb_id, &json).map_err(|e| e.to_string())?;
+        details_to_item(&conn, media_item_id, &raw).map_err(|e| e.to_string())?;
     }
     // A refresh should pick up a changed backdrop too.
     if refresh {
         if let Ok(dir) = posters_dir(app) {
-            let _ = std::fs::remove_file(dir.join(format!("{media_item_id}_backdrop.jpg")));
+            let _ = std::fs::remove_file(backdrop_path_for(&dir, &kind, tmdb_id));
         }
     }
-    let backdrop = backdrop_file(app, media_item_id, raw.backdrop_path.as_deref());
+    let backdrop = backdrop_file(app, &kind, tmdb_id, raw.backdrop_path.as_deref());
     let fetched_at = chrono_free_date(
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
     );
@@ -660,16 +699,25 @@ fn download_poster(poster: &str, dest: &Path) -> Result<(), String> {
     std::fs::write(dest, &bytes).map_err(|e| e.to_string())
 }
 
-/// Apply a chosen match to an item: download the poster and store metadata.
-pub fn apply_match(app: &AppHandle, media_item_id: i64, m: &TmdbMatch) -> Result<(), String> {
+/// Apply a chosen match to an item: poster, metadata, and a note in the
+/// memory so the title keeps it across folder switches. `manual` is a match
+/// picked with Fix match, which automatic matching never replaces.
+pub fn apply_match(app: &AppHandle, media_item_id: i64, m: &TmdbMatch, manual: bool) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let kind: String = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        conn.query_row("SELECT kind FROM media_items WHERE id = ?1", [media_item_id], |r| r.get(0)).map_err(|e| e.to_string())?
+    };
     let mut poster_file: Option<String> = None;
     let mut poster_failed = false;
     if let Some(p) = &m.poster {
-        let dest = posters_dir(app)?.join(format!("{media_item_id}.jpg"));
+        let dest = poster_path_for(&posters_dir(app)?, &kind, m.tmdb_id);
+        // Already on disk from an earlier match of this film: no download.
         // The image is the least of what a match brings. A failed download
         // used to discard the match too, so the title was searched again on
         // every run; now the match stays and only the poster is retried.
-        match download_poster(p, &dest) {
+        let have = std::fs::metadata(&dest).map(|md| md.len() > 0).unwrap_or(false);
+        match if have { Ok(()) } else { download_poster(p, &dest) } {
             Ok(()) => poster_file = Some(dest.to_string_lossy().to_string()),
             Err(e) => {
                 tracing::warn!(media_item_id, "poster download failed: {e}");
@@ -677,8 +725,7 @@ pub fn apply_match(app: &AppHandle, media_item_id: i64, m: &TmdbMatch) -> Result
             }
         }
     }
-    let state = app.state::<AppState>();
-    let (kind, key) = {
+    let key = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
         db::set_tmdb(&conn, media_item_id, Some(m.tmdb_id), poster_file.as_deref(), m.overview.as_deref(), m.rating)
             .map_err(|e| e.to_string())?;
@@ -686,11 +733,7 @@ pub fn apply_match(app: &AppHandle, media_item_id: i64, m: &TmdbMatch) -> Result
             // Leave it for the next "Fetch missing posters" to try again.
             db::clear_poster_checked(&conn, media_item_id).map_err(|e| e.to_string())?;
         }
-        let kind: String = conn
-            .query_row("SELECT kind FROM media_items WHERE id = ?1", [media_item_id], |r| r.get(0))
-            .map_err(|e| e.to_string())?;
-        let key = db::get_setting(&conn, "tmdb_key").map_err(|e| e.to_string())?.unwrap_or_default();
-        (kind, key)
+        db::get_setting(&conn, "tmdb_key").map_err(|e| e.to_string())?.unwrap_or_default()
     };
     // Outside the lock: the genre list is a network request with a 20 s
     // timeout, and every synchronous command waits on that lock.
@@ -699,10 +742,197 @@ pub fn apply_match(app: &AppHandle, media_item_id: i64, m: &TmdbMatch) -> Result
             let _ = db::set_item_genres(&conn, media_item_id, Some(&g));
         }
     }
-    // Episode names and the detail page are nice-to-haves; a failure here must not undo the match.
-    let _ = fetch_episode_titles(app, media_item_id);
-    let _ = get_details(app, media_item_id, true);
+    // Episode names and details are nice-to-haves; a failure here must not
+    // undo the match. Both come from the cache when this film was seen before.
+    let _ = fetch_episode_titles(app, media_item_id, false);
+    let _ = get_details(app, media_item_id, false);
+    apply_cached_details(app, media_item_id);
+    if let Ok(conn) = state.db.lock() {
+        let _ = db::remember_match(&conn, media_item_id, m.poster.as_deref(), manual);
+    }
     Ok(())
+}
+
+/// The poster of a title that is already matched, from what is known about
+/// its match (no search). True when the title now has a poster.
+fn retry_poster(app: &AppHandle, item: &MediaItem, tmdb_id: i64) -> bool {
+    let state = app.state::<AppState>();
+    let Ok(dir) = posters_dir(app) else { return false };
+    let known: Option<String> = state.db.lock().ok().and_then(|conn| {
+        let remembered = db::remembered(&conn, &item.kind, &parser_key(&item.title))
+            .ok()
+            .flatten()
+            .filter(|m| m.tmdb_id == Some(tmdb_id))
+            .and_then(|m| m.poster);
+        remembered.or_else(|| {
+            db::get_details_json(&conn, &item.kind, tmdb_id)
+                .ok()
+                .flatten()
+                .and_then(|(json, _)| serde_json::from_str::<serde_json::Value>(&json).ok())
+                .and_then(|v| v["poster_path"].as_str().map(str::to_string))
+        })
+    });
+    let file = poster_path_for(&dir, &item.kind, tmdb_id);
+    let have = std::fs::metadata(&file).map(|m| m.len() > 0).unwrap_or(false)
+        || known.as_deref().map(|p| download_poster(p, &file).is_ok()).unwrap_or(false);
+    if let Ok(conn) = state.db.lock() {
+        let path = have.then(|| file.to_string_lossy().to_string());
+        let _ = db::set_poster(&conn, item.id, path.as_deref());
+    }
+    have
+}
+
+fn parser_key(title: &str) -> String {
+    crate::parser::sort_key(title)
+}
+
+/// Rating, genres and collection from cached details onto a library title.
+fn details_to_item(conn: &rusqlite::Connection, media_item_id: i64, raw: &RawDetails) -> rusqlite::Result<()> {
+    let rating = raw.vote_average.filter(|v| *v > 0.0).map(|v| (v * 10.0).round() / 10.0);
+    db::set_item_rating(conn, media_item_id, rating)?;
+    let genres: Vec<String> = raw.genres.iter().filter_map(|g| g.name.clone()).filter(|n| !n.is_empty()).collect();
+    db::set_item_genres(conn, media_item_id, (!genres.is_empty()).then(|| genres.join(", ")).as_deref())?;
+    if let Some(c) = &raw.belongs_to_collection {
+        if let (Some(cid), Some(name)) = (c.id, c.name.clone()) {
+            let url = c.poster_path.as_ref().map(|p| format!("{IMG}{p}"));
+            let _ = db::attach_tmdb_collection(conn, media_item_id, cid, &name, url.as_deref());
+        }
+    }
+    Ok(())
+}
+
+fn apply_cached_details(app: &AppHandle, media_item_id: i64) {
+    let state = app.state::<AppState>();
+    let Ok(conn) = state.db.lock() else { return };
+    let row: Option<(String, i64)> = conn
+        .query_row("SELECT kind, tmdb_id FROM media_items WHERE id = ?1 AND tmdb_id IS NOT NULL", [media_item_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .ok();
+    let Some((kind, tmdb_id)) = row else { return };
+    if let Ok(Some((json, _))) = db::get_details_json(&conn, &kind, tmdb_id) {
+        if let Ok(raw) = serde_json::from_str::<RawDetails>(&json) {
+            let _ = details_to_item(&conn, media_item_id, &raw);
+        }
+    }
+}
+
+/// Titles new to the library whose TMDb data is remembered from before,
+/// typically a folder switched back in: everything is applied from disk.
+/// Needs no API key and no network, except to download a poster image that
+/// is somehow not on disk. Titles TMDb had nothing for are not asked again.
+pub fn apply_remembered(app: &AppHandle) -> usize {
+    let state = app.state::<AppState>();
+    let Ok(dir) = posters_dir(app) else { return 0 };
+    let candidates: Vec<(i64, String, String, Option<i32>)> = {
+        let Ok(conn) = state.db.lock() else { return 0 };
+        let Ok(mut stmt) = conn.prepare("SELECT id, kind, sort_key, year FROM media_items WHERE tmdb_id IS NULL AND poster_checked = 0") else {
+            return 0;
+        };
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)));
+        rows.map(|it| it.flatten().collect()).unwrap_or_default()
+    };
+    let (mut reused, mut known_missing) = (0, 0);
+    for (id, kind, sort_key, year) in candidates {
+        let mem = match state.db.lock() {
+            Ok(conn) => db::remembered(&conn, &kind, &sort_key).ok().flatten(),
+            Err(_) => None,
+        };
+        let Some(mem) = mem else { continue };
+        // Titles are keyed by name, so "The Lion King" 2019 finds what was
+        // remembered for the 1994 film; another year is another film, and
+        // gets a search of its own.
+        if let (Some(a), Some(b)) = (year, mem.year) {
+            if (a - b).abs() > 1 {
+                continue;
+            }
+        }
+        let Some(tmdb_id) = mem.tmdb_id else {
+            if let Ok(conn) = state.db.lock() {
+                let _ = db::mark_poster_checked(&conn, id);
+            }
+            known_missing += 1;
+            continue;
+        };
+        let file = poster_path_for(&dir, &kind, tmdb_id);
+        if !file.exists() {
+            if let Some(p) = &mem.poster {
+                let _ = download_poster(p, &file);
+            }
+        }
+        let poster = file.exists().then(|| file.to_string_lossy().to_string());
+        if let Ok(conn) = state.db.lock() {
+            let _ = db::set_tmdb(&conn, id, Some(tmdb_id), poster.as_deref(), mem.overview.as_deref(), mem.rating);
+            if let Some(g) = &mem.genres {
+                let _ = db::set_item_genres(&conn, id, Some(g));
+            }
+            if poster.is_none() && mem.poster.is_some() {
+                let _ = db::clear_poster_checked(&conn, id);
+            }
+        }
+        apply_cached_details(app, id);
+        if kind == "series" {
+            let _ = fetch_episode_titles(app, id, false);
+        }
+        reused += 1;
+    }
+    if reused + known_missing > 0 {
+        tracing::info!(reused, known_missing, "TMDb data reused from earlier, no API calls");
+    }
+    reused
+}
+
+/// Posters used to be named after the library title's id. Those ids are
+/// reused once titles are removed, so a new title could show an old title's
+/// backdrop. Move posters to TMDb-id names once; backdrops, which cannot be
+/// told apart safely, are dropped and fetched again when next shown.
+pub fn migrate_image_names(app: &AppHandle) {
+    let Ok(dir) = posters_dir(app) else { return };
+    let state = app.state::<AppState>();
+    let rows: Vec<(i64, String, i64, Option<String>)> = {
+        let Ok(conn) = state.db.lock() else { return };
+        let Ok(mut stmt) = conn.prepare("SELECT id, kind, tmdb_id, poster_path FROM media_items WHERE tmdb_id IS NOT NULL") else { return };
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)));
+        rows.map(|it| it.flatten().collect()).unwrap_or_default()
+    };
+    let mut moved = 0;
+    for (id, kind, tmdb_id, poster) in rows {
+        let new = poster_path_for(&dir, &kind, tmdb_id);
+        if let Some(old) = poster.map(PathBuf::from).filter(|p| *p != new && p.exists()) {
+            if !new.exists() {
+                let _ = std::fs::rename(&old, &new);
+            }
+            if new.exists() {
+                if let Ok(conn) = state.db.lock() {
+                    let _ = conn.execute("UPDATE media_items SET poster_path = ?2 WHERE id = ?1", rusqlite::params![id, new.to_string_lossy()]);
+                }
+                moved += 1;
+            }
+        }
+        let _ = std::fs::remove_file(dir.join(format!("{id}_backdrop.jpg")));
+    }
+    if moved > 0 {
+        tracing::info!(moved, "posters renamed to TMDb ids");
+    }
+}
+
+/// What is saved locally, for Settings.
+pub fn store_stats(app: &AppHandle) -> Result<db::TmdbStore, String> {
+    let (titles, details) = {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        db::tmdb_store_counts(&conn).map_err(|e| e.to_string())?
+    };
+    let (mut images, mut image_bytes) = (0, 0);
+    if let Ok(rd) = std::fs::read_dir(posters_dir(app)?) {
+        for e in rd.flatten() {
+            if let Ok(md) = e.metadata() {
+                if md.is_file() {
+                    images += 1;
+                    image_bytes += md.len();
+                }
+            }
+        }
+    }
+    Ok(db::TmdbStore { titles, details, images, image_bytes })
 }
 
 #[derive(Serialize, Clone)]
@@ -770,8 +1000,17 @@ fn fetch_pass(app: &AppHandle, force: bool) {
     let started = std::time::Instant::now();
     for (i, item) in items.iter().enumerate() {
         let _ = app.emit("posters-progress", Progress { done: i, total, matched, current: item.title.clone() });
+        // Already matched, only the picture is missing (its download failed):
+        // fetch that picture again. Searching anew could replace a match the
+        // user picked by hand with the top search result.
+        if let Some(tmdb_id) = item.tmdb_id {
+            if retry_poster(app, item, tmdb_id) {
+                matched += 1;
+            }
+            continue;
+        }
         match best_match(&key, item) {
-            Ok(Some(m)) => match apply_match(app, item.id, &m) {
+            Ok(Some(m)) => match apply_match(app, item.id, &m, false) {
                 Ok(()) => {
                     tracing::debug!(title = %item.title, tmdb_id = m.tmdb_id, "matched");
                     matched += 1;
@@ -783,6 +1022,7 @@ fn fetch_pass(app: &AppHandle, force: bool) {
                 let guard = state.db.lock();
                 if let Ok(conn) = guard {
                     let _ = db::mark_poster_checked(&conn, item.id);
+                    let _ = db::remember_not_found(&conn, item.id);
                 }
             }
             Err(e) => {

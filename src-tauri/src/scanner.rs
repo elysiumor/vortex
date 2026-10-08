@@ -99,10 +99,15 @@ pub fn scan_all(conn: &mut Connection) -> Result<ScanStats, String> {
             stats.libraries_skipped.push(lib.path.clone());
             continue;
         }
-        if scan_library(conn, &lib, &ignore, &mut stats)? {
-            stats.libraries_scanned += 1;
-        } else {
-            stats.libraries_skipped.push(lib.path.clone());
+        // One library failing (removed from Settings mid-scan, a database
+        // error) must not cost the others their scan.
+        match scan_library(conn, &lib, &ignore, &mut stats) {
+            Ok(true) => stats.libraries_scanned += 1,
+            Ok(false) => stats.libraries_skipped.push(lib.path.clone()),
+            Err(e) => {
+                tracing::warn!(library = %lib.path, "library scan failed: {e}");
+                stats.libraries_skipped.push(lib.path.clone());
+            }
         }
     }
     db::prune_empty_items(conn).map_err(|e| e.to_string())?;

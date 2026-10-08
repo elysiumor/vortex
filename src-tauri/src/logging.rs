@@ -59,9 +59,14 @@ impl RollingFile {
     fn roll(&mut self) {
         // Closed first: Windows will not rename a file that is open.
         self.file = None;
-        let _ = std::fs::rename(&self.path, self.path.with_extension("log.0"));
-        self.file = File::create(&self.path).ok();
         self.written = 0;
+        if std::fs::rename(&self.path, self.path.with_extension("log.0")).is_err() {
+            // Held open elsewhere (a log viewer): carry on appending rather
+            // than truncating what is there, and try again later.
+            self.file = std::fs::OpenOptions::new().append(true).open(&self.path).ok();
+            return;
+        }
+        self.file = File::create(&self.path).ok();
         if let Some(f) = self.file.as_mut() {
             let _ = writeln!(f, "(continued; the earlier part of this session is in vortex.log.0)");
         }

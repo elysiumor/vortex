@@ -44,8 +44,11 @@ export function useGridKeys(container: Ref<HTMLElement | undefined>) {
     }
     if (next) {
       e.preventDefault();
-      next.focus();
-      next.scrollIntoView({ block: "nearest" });
+      // In a carousel row the browser would scroll the row's clipped viewport
+      // sideways, behind the carousel's back; the row moves itself on focus.
+      // Only bring the row into view vertically.
+      next.focus({ preventScroll: true });
+      (next.closest<HTMLElement>('[data-slot="carousel"]') ?? next).scrollIntoView({ block: "nearest" });
     }
   }
 

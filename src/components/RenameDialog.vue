@@ -4,6 +4,7 @@ import { toast } from "vue-sonner";
 import { ArrowRight, Folder, FileVideo, FileText } from "@lucide/vue";
 import { api, type RenameMove, type RenamePlan } from "../lib/api";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 
 /**
@@ -108,7 +109,7 @@ async function undo() {
           {{ alreadyNamed.length ? "Everything here is already named after TMDb." : "Nothing can be renamed." }}
         </p>
         <label v-for="p in toRename" :key="p.media_item_id" class="flex cursor-pointer gap-3 rounded-lg border p-3 hover:bg-accent/40">
-          <input type="checkbox" class="mt-1 accent-primary" :checked="chosen.has(p.media_item_id)" @change="toggle(p.media_item_id)" />
+          <Checkbox class="mt-0.5" :model-value="chosen.has(p.media_item_id)" @update:model-value="toggle(p.media_item_id)" @click.stop />
           <div class="min-w-0 flex-1 space-y-1">
             <div class="font-medium">{{ p.target }} <span v-if="p.moves.length > 1" class="text-xs font-normal text-muted-foreground">· {{ p.moves.length }} changes</span></div>
             <div v-for="m in shownMoves(p)" :key="m.from" class="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">

@@ -55,7 +55,10 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
 codegen-units = 1
-lto = true
+# Thin rather than fat: fat LTO's final step needed more memory than this
+# machine could commit (no page file) and the release build died there with
+# "LLVM out of memory". Thin keeps nearly all of the speed for a fraction.
+lto = "thin"
 opt-level = 3
 # Unwind rather than abort: a panic in one background task then kills that
 # task instead of the whole app. Line tables are kept so the backtrace in

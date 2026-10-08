@@ -15,7 +15,7 @@ pub fn show_window(app: &AppHandle) {
 
 fn menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let menu = Menu::new(app)?;
-    let items = {
+    let mut items = {
         let state = app.state::<AppState>();
         let guard = state.db.lock();
         match guard {
@@ -23,6 +23,7 @@ fn menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
             Err(_) => Vec::new(),
         }
     };
+    db::fill_available(items.iter_mut().map(|i| &mut i.episode));
     if items.is_empty() {
         let none = MenuItem::with_id(app, "none", "Nothing in progress", false, None::<&str>)?;
         menu.append(&none)?;

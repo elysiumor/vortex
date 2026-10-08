@@ -1,3 +1,5 @@
+import { ref } from "vue";
+
 export type Theme = "system" | "light" | "dark";
 
 const KEY = "vortex-theme";
@@ -9,7 +11,11 @@ function render(t: Theme) {
   document.documentElement.style.colorScheme = dark ? "dark" : "light";
 }
 
+/** The chosen theme, shared by every place that can change it. */
+export const currentTheme = ref<Theme>("system");
+
 export function applyTheme(t: Theme) {
+  currentTheme.value = t;
   render(t);
   try {
     localStorage.setItem(KEY, t);
@@ -27,6 +33,7 @@ export function loadTheme(): Theme {
 /** Call once at startup so the first paint already has the right colours. */
 export function initTheme(): Theme {
   const t = loadTheme();
+  currentTheme.value = t;
   render(t);
   media.addEventListener("change", () => render(loadTheme()));
   return t;

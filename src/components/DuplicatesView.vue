@@ -46,7 +46,7 @@ defineExpose({ reload: load });
 <template>
   <div class="space-y-6">
     <div class="flex items-center gap-3">
-      <h1 class="flex-1 text-2xl font-semibold tracking-tight">Duplicates</h1>
+      <h1 class="flex-1 text-[2.6rem] font-black leading-none tracking-[-0.04em]">Duplicates</h1>
       <span class="text-sm text-muted-foreground" v-if="groups.length">{{ groups.length }} groups · {{ fileSize(wasted) }} recoverable</span>
     </div>
     <p v-if="loading" class="text-sm text-muted-foreground">Checking…</p>

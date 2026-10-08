@@ -9,10 +9,10 @@ import { api, backdropSrc, posterSrc, subtitleCount, type Details, type Episode,
 import { copyText, dateFromUnix, episodeCode, episodeTitle, fileSize, fileSizeExact, folderOf, hms, parseHms, relativeTime } from "../lib/format";
 import RenameDialog from "./RenameDialog.vue";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Separator } from "@/components/ui/separator";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
@@ -186,98 +186,115 @@ defineExpose({ reload: load });
 </script>
 
 <template>
-  <div v-if="!item" class="space-y-4"><Skeleton class="h-72 rounded-xl" /><Skeleton class="h-40 rounded-xl" /></div>
-  <div v-else class="-m-6">
+  <div v-if="!item" class="space-y-4 px-10 pt-24"><Skeleton class="h-[60vh] rounded-3xl" /><Skeleton class="h-40 rounded-xl" /></div>
+  <div v-else>
     <!-- Hero -->
-    <div class="relative bg-cover bg-[center_20%]" :style="details && backdropSrc(details) ? { backgroundImage: `url(${backdropSrc(details)})` } : {}">
-      <div class="hero-fade px-6 pb-8 pt-4">
-        <div class="mb-5 flex flex-wrap items-center gap-2">
-          <Button variant="secondary" size="sm" @click="emit('back')"><ArrowLeft /> Back</Button>
+    <div class="relative min-h-[600px] overflow-hidden">
+      <img v-if="details && backdropSrc(details)" :src="backdropSrc(details)!" alt="" draggable="false"
+           class="absolute inset-0 h-full w-full object-cover object-[center_22%] animate-in fade-in duration-700" />
+      <img v-else-if="posterSrc(item)" :src="posterSrc(item)!" alt="" draggable="false"
+           class="absolute inset-0 h-full w-full scale-125 object-cover opacity-45 blur-3xl" />
+      <div class="hero-fade absolute inset-0"></div>
+
+      <div class="relative z-10 mx-auto max-w-[1920px] px-10 pb-12 pt-20">
+        <div class="mb-10 flex flex-wrap items-center gap-2">
+          <Button variant="soft" size="sm" class="rounded-full" @click="emit('back')"><ArrowLeft /> Back</Button>
           <div class="flex-1"></div>
           <template v-if="categoryEditing">
-            <Input v-model="categoryValue" list="cats" placeholder="Category" class="h-8 w-44" autofocus @keyup.enter="saveCategory" @keyup.esc="categoryEditing = false" />
+            <Input v-model="categoryValue" list="cats" placeholder="Category" class="h-8 w-44 rounded-full" autofocus @keyup.enter="saveCategory" @keyup.esc="categoryEditing = false" />
             <datalist id="cats"><option v-for="c in knownCategories" :key="c" :value="c" /></datalist>
-            <Button size="sm" @click="saveCategory">Save</Button>
-            <Button size="sm" variant="ghost" @click="categoryEditing = false">Cancel</Button>
+            <Button size="sm" class="rounded-full" @click="saveCategory">Save</Button>
+            <Button size="sm" variant="ghost" class="rounded-full" @click="categoryEditing = false">Cancel</Button>
           </template>
-          <Badge v-else variant="outline" class="cursor-pointer" @click="startCategoryEdit">{{ item.category || "No category" }}</Badge>
-          <Button variant="secondary" size="sm" @click="openMatch"><Search /> Fix match</Button>
-          <Button v-if="item.tmdb_id" variant="secondary" size="sm" :disabled="detailsBusy" @click="loadDetails(true)"><RefreshCw :class="{ 'animate-spin': detailsBusy }" /> Refresh</Button>
-          <Button v-if="item.tmdb_id" variant="secondary" size="sm" @click="renameOpen = true"><FilePen /> Rename files</Button>
-          <Button variant="secondary" size="sm" @click="markAll(!allDone)"><component :is="allDone ? RotateCcw : Check" /> {{ allDone ? "Mark all unwatched" : "Mark all watched" }}</Button>
+          <Button v-else variant="soft" size="sm" class="rounded-full" title="Change category" @click="startCategoryEdit">{{ item.category || "No category" }}</Button>
+          <Button variant="soft" size="sm" class="rounded-full" @click="openMatch"><Search /> Fix match</Button>
+          <Button v-if="item.tmdb_id" variant="soft" size="sm" class="rounded-full" :disabled="detailsBusy" @click="loadDetails(true)"><RefreshCw :class="{ 'animate-spin': detailsBusy }" /> Refresh</Button>
+          <Button v-if="item.tmdb_id" variant="soft" size="sm" class="rounded-full" @click="renameOpen = true"><FilePen /> Rename files</Button>
+          <Button variant="soft" size="sm" class="rounded-full" @click="markAll(!allDone)"><component :is="allDone ? RotateCcw : Check" /> {{ allDone ? "Mark all unwatched" : "Mark all watched" }}</Button>
         </div>
 
-        <div class="flex gap-7">
-          <img v-if="posterSrc(item)" :src="posterSrc(item)!" :alt="item.title" class="poster-shadow h-[300px] w-[200px] shrink-0 rounded-xl object-cover" />
-          <div v-else class="poster-shadow grid h-[300px] w-[200px] shrink-0 place-items-center rounded-xl bg-muted text-5xl font-semibold text-muted-foreground">{{ item.title.slice(0, 1) }}</div>
+        <div class="flex items-end gap-10">
+          <img v-if="posterSrc(item)" :src="posterSrc(item)!" :alt="item.title" class="poster-shadow hidden h-[390px] w-[260px] shrink-0 rounded-2xl object-cover ring-1 ring-white/10 lg:block" />
+          <div v-else class="poster-shadow hidden h-[390px] w-[260px] shrink-0 place-items-center rounded-2xl bg-muted text-6xl font-black text-muted-foreground lg:grid">{{ item.title.slice(0, 1) }}</div>
 
-          <div class="min-w-0 flex-1">
-            <h1 class="text-3xl font-semibold leading-tight tracking-tight">{{ details?.title || item.title }} <span class="font-normal text-muted-foreground" v-if="year">({{ year }})</span></h1>
-            <div class="text-muted-foreground" v-if="details?.original_title && details.original_title !== details.title">{{ details.original_title }}</div>
+          <div class="min-w-0 flex-1 pb-1">
+            <div class="text-brand mb-2 text-xs font-extrabold uppercase tracking-[0.24em]">{{ item.kind === "series" ? "Series" : "Movie" }}<template v-if="item.category"> · {{ item.category }}</template></div>
+            <h1 class="text-[clamp(2.4rem,4.6vw,4.25rem)] font-black leading-[0.98] tracking-[-0.04em]">{{ details?.title || item.title }}</h1>
+            <div class="mt-1 text-lg text-foreground/60" v-if="details?.original_title && details.original_title !== details.title">{{ details.original_title }}</div>
 
-            <div class="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm" v-if="details">
-              <span class="flex items-center gap-1 font-semibold text-warning" v-if="details.rating"><Star class="size-4 fill-current" />{{ details.rating.toFixed(1) }}<span class="font-normal text-muted-foreground" v-if="details.vote_count"> ({{ details.vote_count.toLocaleString() }})</span></span>
-              <Badge variant="outline" v-if="details.certification">{{ details.certification }}</Badge>
+            <div class="mt-5 flex flex-wrap items-center gap-x-3 gap-y-2 text-sm font-medium text-foreground/80">
+              <span class="bg-brand flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-extrabold" v-if="details?.rating"><Star class="size-3 fill-current" />{{ details.rating.toFixed(1) }}</span>
+              <span class="text-foreground/55" v-if="details?.vote_count">{{ details.vote_count.toLocaleString() }} votes</span>
+              <span v-if="year">{{ year }}</span>
+              <span class="rounded border border-foreground/25 px-1.5 text-xs" v-if="details?.certification">{{ details.certification }}</span>
               <span v-if="runtime">{{ runtime }}<template v-if="item.kind === 'series'"> / ep</template></span>
-              <span v-if="item.kind === 'series' && details.number_of_seasons">{{ details.number_of_seasons }} season{{ details.number_of_seasons === 1 ? "" : "s" }} · {{ details.number_of_episodes }} episodes</span>
-              <span v-if="details.status && item.kind === 'series'">{{ details.status }}</span>
-              <span v-if="details.language" class="uppercase">{{ details.language }}</span>
+              <span v-if="item.kind === 'series' && details?.number_of_seasons">{{ details.number_of_seasons }} season{{ details.number_of_seasons === 1 ? "" : "s" }} · {{ details.number_of_episodes }} episodes</span>
+              <span v-if="details?.status && item.kind === 'series'">{{ details.status }}</span>
+              <span v-if="details?.language" class="uppercase">{{ details.language }}</span>
             </div>
-            <div class="mt-2 flex flex-wrap gap-1.5" v-if="details?.genres.length"><Badge v-for="g in details.genres" :key="g" variant="secondary">{{ g }}</Badge></div>
-
-            <p class="mt-3 italic text-muted-foreground" v-if="details?.tagline">{{ details.tagline }}</p>
-            <p class="mt-2 max-w-3xl leading-relaxed" v-if="details?.overview || item.overview">{{ details?.overview || item.overview }}</p>
-
-            <div class="mt-3 grid gap-0.5 text-sm" v-if="details">
-              <div v-if="details.creators.length"><span class="inline-block w-24 text-muted-foreground">Created by</span>{{ details.creators.join(", ") }}</div>
-              <div v-if="details.directors.length"><span class="inline-block w-24 text-muted-foreground">Director</span>{{ details.directors.join(", ") }}</div>
-              <div v-if="details.writers.length"><span class="inline-block w-24 text-muted-foreground">Writers</span>{{ details.writers.slice(0, 4).join(", ") }}</div>
-              <div v-if="details.companies.length"><span class="inline-block w-24 text-muted-foreground">{{ item.kind === "series" ? "Network" : "Studio" }}</span>{{ details.companies.join(", ") }}</div>
-              <div v-if="details.release_date"><span class="inline-block w-24 text-muted-foreground">{{ item.kind === "series" ? "Aired" : "Released" }}</span>{{ details.release_date }}<template v-if="details.last_air_date && details.last_air_date !== details.release_date"> → {{ details.last_air_date }}</template></div>
+            <div class="mt-4 flex flex-wrap gap-2" v-if="details?.genres.length">
+              <span v-for="g in details.genres" :key="g" class="rounded-full border border-foreground/12 bg-foreground/[0.06] px-3 py-1 text-xs font-medium backdrop-blur">{{ g }}</span>
             </div>
 
-            <div class="mt-4 flex flex-wrap items-center gap-2">
-              <Button size="lg" :disabled="!primary || !primary.available" @click="play(primary)"><Play class="fill-current" /> {{ primaryLabel }}</Button>
-              <Button variant="outline" v-if="details?.trailer_youtube" @click="open(`https://www.youtube.com/watch?v=${details.trailer_youtube}`)"><Clapperboard /> Trailer</Button>
-              <Button variant="outline" v-if="details?.imdb_id" @click="open(`https://www.imdb.com/title/${details.imdb_id}/`)"><ExternalLink /> IMDb</Button>
-              <Button variant="outline" v-if="details" @click="open(details.tmdb_url)"><ExternalLink /> TMDB</Button>
-              <Button variant="outline" v-if="itemFolder" :title="itemFolder" @click="reveal(episodes[0].path)"><FolderOpen /> Folder</Button>
-            </div>
-            <p class="mt-3 text-sm text-muted-foreground" v-if="!item.tmdb_id">Not matched to TMDB yet. Click <strong>Fix match</strong> for the poster, cast and description.</p>
+            <p class="mt-5 text-lg font-medium italic text-foreground/70" v-if="details?.tagline">“{{ details.tagline }}”</p>
+            <p class="mt-2 max-w-3xl text-[15px] leading-7 text-foreground/80" v-if="details?.overview || item.overview">{{ details?.overview || item.overview }}</p>
 
-            <div class="mt-4 flex flex-wrap items-center gap-1.5 text-sm">
-              <TagIcon class="mr-1 size-4 text-muted-foreground" />
-              <Badge v-for="t in itemTags" :key="t" variant="secondary" class="gap-1 pr-1">{{ t }} <button class="rounded-full p-0.5 hover:bg-destructive hover:text-white" @click="removeTag(t)"><X class="size-3" /></button></Badge>
-              <Input v-model="tagInput" list="all-tags" placeholder="+ tag" class="h-7 w-32 rounded-full text-xs" @keyup.enter="addTag" @blur="addTag" />
-              <datalist id="all-tags"><option v-for="t in allTags" :key="t" :value="t" /></datalist>
+            <div class="mt-7 flex flex-wrap items-center gap-3">
+              <Button variant="brand" size="xl" :disabled="!primary || !primary.available" @click="play(primary)"><Play class="fill-current" /> {{ primaryLabel }}</Button>
+              <Button variant="soft" size="lg" class="h-12 rounded-full px-5" v-if="details?.trailer_youtube" @click="open(`https://www.youtube.com/watch?v=${details.trailer_youtube}`)"><Clapperboard /> Trailer</Button>
+              <Button variant="soft" size="icon-lg" class="size-12 rounded-full" v-if="details?.imdb_id" title="IMDb" @click="open(`https://www.imdb.com/title/${details.imdb_id}/`)"><span class="text-[11px] font-black">IMDb</span></Button>
+              <Button variant="soft" size="icon-lg" class="size-12 rounded-full" v-if="details" title="TMDb" @click="open(details.tmdb_url)"><ExternalLink /></Button>
+              <Button variant="soft" size="icon-lg" class="size-12 rounded-full" v-if="itemFolder" :title="itemFolder" @click="reveal(episodes[0].path)"><FolderOpen /></Button>
             </div>
-            <div class="mt-2 flex flex-wrap items-center gap-1.5 text-sm">
-              <Layers class="mr-1 size-4 text-muted-foreground" />
-              <Badge v-for="c in itemCollections" :key="c" variant="secondary" class="gap-1 pr-1">{{ c }} <button class="rounded-full p-0.5 hover:bg-destructive hover:text-white" @click="removeFromCollection(c)"><X class="size-3" /></button></Badge>
-              <DropdownMenu>
-                <DropdownMenuTrigger as-child><Button variant="outline" size="xs" class="rounded-full"><Plus /> collection</Button></DropdownMenuTrigger>
-                <DropdownMenuContent align="start">
-                  <DropdownMenuItem v-for="c in allCollections.filter((x) => !itemCollections.includes(x.name))" :key="c.id" @select="addToCollection(c.id)">{{ c.name }}</DropdownMenuItem>
-                  <DropdownMenuSeparator v-if="allCollections.length" />
-                  <DropdownMenuItem @select="newCollectionOpen = true"><Plus /> New collection…</DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </div>
+            <p class="mt-4 text-sm text-muted-foreground" v-if="!item.tmdb_id">Not matched to TMDB yet. Click <strong>Fix match</strong> for the poster, cast and description.</p>
           </div>
         </div>
       </div>
     </div>
 
-    <div class="space-y-8 px-6 pb-8">
+    <div class="mx-auto max-w-[1920px] space-y-12 px-10 pb-16">
+      <!-- People and tags -->
+      <div class="grid gap-x-12 gap-y-6 lg:grid-cols-2">
+        <div class="grid content-start gap-2 text-sm" v-if="details">
+          <div v-if="details.creators.length"><span class="inline-block w-28 text-muted-foreground">Created by</span><span class="font-medium">{{ details.creators.join(", ") }}</span></div>
+          <div v-if="details.directors.length"><span class="inline-block w-28 text-muted-foreground">Director</span><span class="font-medium">{{ details.directors.join(", ") }}</span></div>
+          <div v-if="details.writers.length"><span class="inline-block w-28 text-muted-foreground">Writers</span><span class="font-medium">{{ details.writers.slice(0, 4).join(", ") }}</span></div>
+          <div v-if="details.companies.length"><span class="inline-block w-28 text-muted-foreground">{{ item.kind === "series" ? "Network" : "Studio" }}</span><span class="font-medium">{{ details.companies.join(", ") }}</span></div>
+          <div v-if="details.release_date"><span class="inline-block w-28 text-muted-foreground">{{ item.kind === "series" ? "Aired" : "Released" }}</span><span class="font-medium">{{ details.release_date }}<template v-if="details.last_air_date && details.last_air_date !== details.release_date"> → {{ details.last_air_date }}</template></span></div>
+        </div>
+        <div class="grid content-start gap-3">
+          <div class="flex flex-wrap items-center gap-1.5 text-sm">
+            <TagIcon class="mr-1 size-4 text-muted-foreground" />
+            <span v-for="t in itemTags" :key="t" class="flex items-center gap-1 rounded-full bg-secondary py-0.5 pl-3 pr-1 text-xs font-medium">{{ t }} <button class="rounded-full p-0.5 hover:bg-destructive hover:text-white" @click="removeTag(t)"><X class="size-3" /></button></span>
+            <Input v-model="tagInput" list="all-tags" placeholder="+ tag" class="h-7 w-32 rounded-full text-xs" @keyup.enter="addTag" @blur="addTag" />
+            <datalist id="all-tags"><option v-for="t in allTags" :key="t" :value="t" /></datalist>
+          </div>
+          <div class="flex flex-wrap items-center gap-1.5 text-sm">
+            <Layers class="mr-1 size-4 text-muted-foreground" />
+            <span v-for="c in itemCollections" :key="c" class="flex items-center gap-1 rounded-full bg-secondary py-0.5 pl-3 pr-1 text-xs font-medium">{{ c }} <button class="rounded-full p-0.5 hover:bg-destructive hover:text-white" @click="removeFromCollection(c)"><X class="size-3" /></button></span>
+            <DropdownMenu>
+              <DropdownMenuTrigger as-child><Button variant="outline" size="xs" class="rounded-full"><Plus /> collection</Button></DropdownMenuTrigger>
+              <DropdownMenuContent align="start">
+                <DropdownMenuItem v-for="c in allCollections.filter((x) => !itemCollections.includes(x.name))" :key="c.id" @select="addToCollection(c.id)">{{ c.name }}</DropdownMenuItem>
+                <DropdownMenuSeparator v-if="allCollections.length" />
+                <DropdownMenuItem @select="newCollectionOpen = true"><Plus /> New collection…</DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        </div>
+      </div>
+
       <!-- Cast -->
       <section v-if="details?.cast.length">
-        <h2 class="mb-3 text-sm font-medium uppercase tracking-wider text-muted-foreground">Cast</h2>
-        <div class="no-scrollbar flex gap-3 overflow-x-auto pb-2">
-          <div v-for="c in visibleCast" :key="c.name + c.character" class="w-28 shrink-0">
-            <img v-if="c.photo_url" :src="c.photo_url" :alt="c.name" loading="lazy" class="h-40 w-28 rounded-lg object-cover bg-muted" />
-            <div v-else class="grid h-40 w-28 place-items-center rounded-lg bg-muted text-2xl text-muted-foreground">{{ c.name.slice(0, 1) }}</div>
-            <div class="mt-1.5 text-sm font-medium leading-tight">{{ c.name }}</div>
-            <div class="text-xs leading-tight text-muted-foreground" v-if="c.character">{{ c.character }}</div>
+        <h2 class="section-title mb-5 text-[1.3rem]">Cast &amp; crew</h2>
+        <div class="no-scrollbar flex gap-6 overflow-x-auto pb-2">
+          <div v-for="c in visibleCast" :key="c.name + c.character" class="w-[112px] shrink-0 text-center">
+            <Avatar class="mx-auto size-24 ring-2 ring-border transition-transform hover:scale-105">
+              <AvatarImage v-if="c.photo_url" :src="c.photo_url" :alt="c.name" class="object-cover" />
+              <AvatarFallback class="bg-gradient-to-br from-secondary to-accent text-2xl font-bold text-muted-foreground">{{ c.name.split(" ").map((w) => w[0]).slice(0, 2).join("") }}</AvatarFallback>
+            </Avatar>
+            <div class="mt-2.5 text-sm font-semibold leading-tight">{{ c.name }}</div>
+            <div class="mt-0.5 text-xs leading-tight text-muted-foreground" v-if="c.character">{{ c.character }}</div>
           </div>
         </div>
         <Button variant="link" size="sm" class="px-0" v-if="details.cast.length > 8" @click="showAllCast = !showAllCast">{{ showAllCast ? "Show fewer" : `Show all ${details.cast.length}` }}</Button>
@@ -286,8 +303,8 @@ defineExpose({ reload: load });
       <!-- Episodes / files -->
       <template v-for="[season, eps] in (item.kind === 'series' ? seasons : [[null, mainEpisodes] as [number | null, Episode[]]])" :key="season ?? 'files'">
         <section>
-          <div class="mb-2 flex items-baseline gap-3">
-            <h2 class="text-sm font-medium uppercase tracking-wider text-muted-foreground">
+          <div class="mb-4 flex items-baseline gap-3">
+            <h2 class="section-title text-[1.3rem]">
               {{ item.kind === "series" ? (season != null ? seasonInfo(season)?.name || `Season ${season}` : "Unsorted") : (eps.length === 1 ? "File" : "Files") }}
             </h2>
             <span class="text-xs text-muted-foreground" v-if="seasonInfo(season)">{{ eps.length }} of {{ seasonInfo(season)!.episode_count }} on disk<template v-if="seasonInfo(season)!.air_date"> · {{ seasonInfo(season)!.air_date!.slice(0, 4) }}</template></span>
@@ -296,19 +313,20 @@ defineExpose({ reload: load });
 
           <div class="space-y-1.5">
             <template v-for="ep in eps" :key="ep.id">
-              <div class="grid items-center gap-3 rounded-lg border bg-card px-3 py-2 transition-colors hover:border-primary/40"
-                   :class="[item.kind === 'series' ? 'grid-cols-[140px_1fr_auto]' : 'grid-cols-[64px_1fr_auto]', { 'opacity-60': !ep.available, 'border-primary rounded-b-none': openDetails === ep.id }]"
+              <div class="group/ep card-shadow grid items-center gap-4 rounded-2xl border border-transparent bg-card p-3 transition-all hover:border-primary/30 hover:bg-accent/40"
+                   :class="[item.kind === 'series' ? 'grid-cols-[200px_1fr_auto]' : 'grid-cols-[64px_1fr_auto]', { 'opacity-60': !ep.available, 'border-primary/50 rounded-b-none': openDetails === ep.id }]"
                    @dblclick="play(ep)">
-                <div v-if="item.kind === 'series'" class="relative aspect-video cursor-pointer overflow-hidden rounded-md bg-muted" @click="play(ep)">
-                  <img v-if="ep.still_path" :src="ep.still_path" loading="lazy" alt="" class="h-full w-full object-cover" />
-                  <div v-if="ep.duration_secs && ep.position_secs > 0 && !ep.completed" class="absolute inset-x-0 bottom-0 h-1 bg-black/50"><div class="h-full bg-primary" :style="{ width: (100 * ep.position_secs / ep.duration_secs) + '%' }"></div></div>
-                  <div v-if="ep.completed" class="absolute right-1.5 top-1.5 grid size-5 place-items-center rounded-full bg-success text-white"><Check class="size-3" /></div>
+                <div v-if="item.kind === 'series'" class="relative aspect-video cursor-pointer overflow-hidden rounded-xl bg-muted" @click="play(ep)" @dblclick.stop>
+                  <img v-if="ep.still_path" :src="ep.still_path" loading="lazy" alt="" class="h-full w-full object-cover transition-transform duration-500 group-hover/ep:scale-105" />
+                  <div class="absolute inset-0 grid place-items-center bg-black/35 opacity-0 transition-opacity group-hover/ep:opacity-100"><span class="bg-brand grid size-10 place-items-center rounded-full shadow-lg"><Play class="ml-0.5 size-4 fill-current" /></span></div>
+                  <div v-if="ep.duration_secs && ep.position_secs > 0 && !ep.completed" class="absolute inset-x-0 bottom-0 h-1 bg-black/50"><div class="bg-brand h-full" :style="{ width: (100 * ep.position_secs / ep.duration_secs) + '%' }"></div></div>
+                  <div v-if="ep.completed" class="bg-brand absolute right-1.5 top-1.5 grid size-5 place-items-center rounded-full"><Check class="size-3" stroke-width="3" /></div>
                 </div>
                 <div v-else class="text-center text-sm font-semibold" :class="ep.completed ? 'text-success' : 'text-primary'">{{ quality(ep) ?? (ep.completed ? "✓" : "▶") }}</div>
 
                 <div class="min-w-0">
-                  <div class="truncate font-medium">
-                    <span class="mr-1.5 text-primary" v-if="item.kind === 'series'">{{ episodeCode(ep) }}</span>{{ item.kind === "series" ? episodeTitle(ep) : ep.file_name }}
+                  <div class="truncate text-[15px] font-semibold">
+                    <span class="mr-2 font-bold text-primary" v-if="item.kind === 'series'">{{ episodeCode(ep) }}</span>{{ item.kind === "series" ? episodeTitle(ep) : ep.file_name }}
                     <span class="ml-2 text-xs text-warning" v-if="ep.rating">★ {{ ep.rating.toFixed(1) }}</span>
                     <span class="ml-2 text-xs text-muted-foreground" v-if="ep.air_date">{{ ep.air_date }}</span>
                   </div>
@@ -332,12 +350,12 @@ defineExpose({ reload: load });
                     <Tooltip><TooltipTrigger as-child><Button size="icon-sm" :variant="openDetails === ep.id ? 'default' : 'ghost'" @click="toggleDetails(ep)"><Info /></Button></TooltipTrigger><TooltipContent>File details</TooltipContent></Tooltip>
                     <Tooltip><TooltipTrigger as-child><Button size="icon-sm" variant="ghost" @click="startEdit(ep)"><Timer /></Button></TooltipTrigger><TooltipContent>Set paused time</TooltipContent></Tooltip>
                     <Tooltip><TooltipTrigger as-child><Button size="icon-sm" variant="ghost" @click="toggleWatched(ep)"><component :is="ep.completed ? RotateCcw : Check" /></Button></TooltipTrigger><TooltipContent>{{ ep.completed ? "Mark unwatched" : "Mark watched" }}</TooltipContent></Tooltip>
-                    <Button size="sm" :disabled="!ep.available" @click="play(ep)"><Play class="fill-current" /> {{ ep.position_secs > 0 && !ep.completed ? "Resume" : "Play" }}</Button>
+                    <Button size="sm" variant="brand" class="rounded-full" :disabled="!ep.available" @click="play(ep)" @dblclick.stop><Play class="fill-current" /> {{ ep.position_secs > 0 && !ep.completed ? "Resume" : "Play" }}</Button>
                   </template>
                 </div>
               </div>
 
-              <div v-if="openDetails === ep.id" class="-mt-1.5 grid grid-cols-[110px_1fr] gap-x-4 gap-y-1.5 rounded-b-lg border border-t-0 border-primary bg-accent/40 px-4 py-3 text-sm">
+              <div v-if="openDetails === ep.id" class="-mt-1.5 grid grid-cols-[110px_1fr] gap-x-4 gap-y-1.5 rounded-b-2xl border border-t-0 border-primary/50 bg-accent/40 px-4 py-3 text-sm">
                 <span class="text-muted-foreground">File</span><span class="break-all select-text">{{ ep.file_name }}</span>
                 <span class="text-muted-foreground">Folder</span><span class="break-all select-text">{{ folderOf(ep.path) }}</span>
                 <span class="text-muted-foreground">Full path</span><span class="break-all select-text">{{ ep.path }}</span>
@@ -360,11 +378,11 @@ defineExpose({ reload: load });
 
       <!-- Extras -->
       <section v-if="extras.length">
-        <h2 class="mb-3 text-sm font-medium uppercase tracking-wider text-muted-foreground">Extras <span class="normal-case font-normal">· not counted as episodes</span></h2>
+        <h2 class="section-title mb-4 text-[1.3rem]">Extras <span class="text-sm font-normal text-muted-foreground">not counted as episodes</span></h2>
         <div v-for="[label, list] in extras" :key="label" class="mb-4">
           <div class="mb-1.5 text-xs font-medium text-muted-foreground">{{ label }}</div>
           <div class="space-y-1.5">
-            <div v-for="ep in list" :key="ep.id" class="grid grid-cols-[32px_1fr_auto] items-center gap-3 rounded-lg border bg-card px-3 py-2" :class="{ 'opacity-60': !ep.available }" @dblclick="play(ep)">
+            <div v-for="ep in list" :key="ep.id" class="card-shadow grid grid-cols-[32px_1fr_auto] items-center gap-3 rounded-2xl bg-card px-3 py-2.5" :class="{ 'opacity-60': !ep.available }" @dblclick="play(ep)">
               <div class="text-center" :class="ep.completed ? 'text-success' : 'text-primary'"><component :is="ep.completed ? Check : Play" class="mx-auto size-4" /></div>
               <div class="min-w-0">
                 <div class="truncate font-medium" :title="ep.path">{{ ep.file_name.replace(/\.[^.]+$/, "") }}</div>
@@ -373,7 +391,7 @@ defineExpose({ reload: load });
               <div class="flex items-center gap-1">
                 <Button size="icon-sm" variant="ghost" :disabled="!ep.available" title="Show in Explorer" @click="reveal(ep.path)"><FolderOpen /></Button>
                 <Button size="icon-sm" variant="ghost" @click="toggleWatched(ep)"><component :is="ep.completed ? RotateCcw : Check" /></Button>
-                <Button size="sm" :disabled="!ep.available" @click="play(ep)"><Play class="fill-current" /> Play</Button>
+                <Button size="sm" :disabled="!ep.available" @click="play(ep)" @dblclick.stop><Play class="fill-current" /> Play</Button>
               </div>
             </div>
           </div>

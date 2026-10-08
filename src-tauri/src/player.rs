@@ -94,7 +94,10 @@ static SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// tracker alive, its final save pending, until every VLC window was closed.
 fn still_tracking(link: &Link, child_gone: bool, seen_playing: bool, my_session: u64, sys: &mut sysinfo::System, exe_name: &str) -> bool {
     use std::sync::atomic::Ordering;
-    if !link.per_launch() && SESSION.load(Ordering::SeqCst) != my_session {
+    // A per-launch link we never heard from means the file was handed to a
+    // player already running (VLC "one instance"); that is as shared as a
+    // PotPlayer window, so a newer playback takes over here too.
+    if (!link.per_launch() || !seen_playing) && SESSION.load(Ordering::SeqCst) != my_session {
         return false;
     }
     if !child_gone {

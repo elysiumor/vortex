@@ -3,7 +3,7 @@
 
 use crate::{db, probe, scanner, tmdb, tray, AppState};
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tauri::{AppHandle, Emitter, Manager};
 
 #[derive(Serialize, Clone)]
@@ -32,6 +32,11 @@ pub fn setting_on(app: &AppHandle, key: &str, default: bool) -> bool {
 pub struct Job {
     running: AtomicBool,
     again: AtomicBool,
+    /// Callers waiting in `own` (a Rescan, a rename). The owner yields to them
+    /// between passes instead of going again itself, so a steady stream of
+    /// folder changes cannot keep them waiting forever. Requests made
+    /// meanwhile are not lost: `again` stays set for the waiter to serve.
+    waiting: AtomicUsize,
 }
 
 impl Job {
@@ -46,15 +51,23 @@ impl Job {
         true
     }
 
-    /// Take the job only if it is idle, without asking a running pass to go again.
-    fn try_own(&self) -> bool {
-        !self.running.swap(true, Ordering::SeqCst)
+    /// Wait until the job is idle and take it, without asking a running pass
+    /// to go again.
+    fn own(&self) {
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        while self.running.swap(true, Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        self.waiting.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// Called by the owner after each pass. True means another pass was
     /// asked for meanwhile and the owner must run it.
     pub fn another_pass(&self) -> bool {
         self.running.store(false, Ordering::SeqCst);
+        if self.waiting.load(Ordering::SeqCst) > 0 {
+            return false; // a waiter takes over, and serves `again` itself
+        }
         // Checked after letting go, so a request landing in between is either
         // seen here or wins `begin` itself; it cannot fall through the gap.
         if self.again.load(Ordering::SeqCst) && !self.running.swap(true, Ordering::SeqCst) {
@@ -97,10 +110,7 @@ pub fn refresh(app: &AppHandle, reason: &str) {
 /// scan rather than folding into it, so the numbers returned are this scan's
 /// and two scans never write at once.
 pub fn scan_now(app: &AppHandle) -> Result<scanner::ScanStats, String> {
-    let state = app.state::<AppState>();
-    while !state.scan_job.try_own() {
-        std::thread::sleep(std::time::Duration::from_millis(250));
-    }
+    app.state::<AppState>().scan_job.own();
     run_scans(app, "manual")
 }
 
@@ -109,13 +119,11 @@ pub fn scan_now(app: &AppHandle) -> Result<scanner::ScanStats, String> {
 /// asked for meanwhile are deferred, not dropped.
 pub fn exclusive<T>(app: &AppHandle, f: impl FnOnce() -> T) -> T {
     let state = app.state::<AppState>();
-    while !state.scan_job.try_own() {
-        std::thread::sleep(std::time::Duration::from_millis(250));
-    }
-    let out = {
-        let _release = state.scan_job.release_on_panic();
-        f()
-    };
+    state.scan_job.own();
+    // One guard over both: a panic in the deferred scans below would
+    // otherwise leave the job marked running, and every later scan dropped.
+    let _release = state.scan_job.release_on_panic();
+    let out = f();
     while state.scan_job.another_pass() {
         let _ = scan_once(app, "watch");
     }
@@ -176,6 +184,11 @@ fn scan_once(app: &AppHandle, reason: &str) -> Result<scanner::ScanStats, String
                 let _ = app.notification().builder().title(title).body(body).show();
             }
             if stats.changed() || reason == "startup" {
+                // Titles seen before (a folder switched back in) get their
+                // TMDb data from disk; only the rest go to TMDb below.
+                if tmdb::apply_remembered(app) > 0 {
+                    let _ = app.emit("library-changed", ());
+                }
                 let _ = probe::probe_missing(app.clone());
                 if setting_on(app, "tmdb_connected", false) {
                     let _ = tmdb::fetch_missing(app.clone(), false);

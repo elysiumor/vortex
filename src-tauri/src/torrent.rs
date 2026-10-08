@@ -168,6 +168,29 @@ pub struct Engine {
     /// When each torrent was added this run, for "time elapsed".
     added: std::sync::Mutex<std::collections::HashMap<usize, std::time::Instant>>,
     limits: (u32, u32),
+    /// Streams started per torrent. Only the newest stream's player closing
+    /// may pause the torrent; an older one ending (a shared player window
+    /// taken over, a second window closed) would stall the stream still playing.
+    streams: std::sync::Mutex<std::collections::HashMap<usize, u64>>,
+    /// Torrents with a completion watcher, so Keep does not start a second
+    /// one that races the first to move the files.
+    watching: std::sync::Mutex<std::collections::HashSet<usize>>,
+}
+
+/// Takes a torrent off the watched set when its watcher ends, however it ends.
+struct Watching {
+    engine: std::sync::Weak<Engine>,
+    id: usize,
+}
+
+impl Drop for Watching {
+    fn drop(&mut self) {
+        if let Some(e) = self.engine.upgrade() {
+            if let Ok(mut w) = e.watching.lock() {
+                w.remove(&self.id);
+            }
+        }
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -386,6 +409,8 @@ impl Engine {
             dests_file,
             api,
             added: std::sync::Mutex::new(Default::default()),
+            streams: std::sync::Mutex::new(Default::default()),
+            watching: std::sync::Mutex::new(Default::default()),
             limits: (cfg.down_kbps, cfg.up_kbps),
         });
         // Torrents remembered from the last run: resume watching for completion.
@@ -947,10 +972,25 @@ impl Engine {
         }
 
         let start_secs = self.dest_for(&hash).map(|d| d.position_secs).unwrap_or(0);
+        let generation = self
+            .streams
+            .lock()
+            .map(|mut m| {
+                let g = m.entry(id).or_default();
+                *g += 1;
+                *g
+            })
+            .unwrap_or(0);
         let engine = self.clone();
         let app2 = app.clone();
         let name2 = name.clone();
         let on_end: Box<dyn FnOnce(crate::player::StreamEnd) + Send> = Box::new(move |end| {
+            // A newer stream of this torrent is playing: it owns the torrent,
+            // its resume point and the prompt when it ends.
+            let newest = engine.streams.lock().ok().and_then(|m| m.get(&id).copied()) == Some(generation);
+            if !newest {
+                return;
+            }
             let handle = engine.session.get(TorrentIdOrHash::Id(id));
             let finished = handle.as_ref().map(|t| t.stats().finished).unwrap_or(false);
             // Read now, not when the stream started: Keep may have been
@@ -1031,8 +1071,14 @@ impl Engine {
         // every stopped engine alive after Apply in Settings, with its threads
         // and its paused torrents' open files.
         let weak = Arc::downgrade(self);
+        let id = t.id();
+        let first = self.watching.lock().map(|mut w| w.insert(id)).unwrap_or(true);
+        if !first {
+            return; // already watched; that watcher sees Keep when it finishes
+        }
+        let guard = Watching { engine: weak.clone(), id };
         self.rt().spawn(async move {
-            let id = t.id();
+            let _guard = guard;
             // Polled. librqbit's `wait_until_completed` waits on the live state
             // that exists when it is called, and pausing replaces that state,
             // so a download paused and resumed once never moved into the library.

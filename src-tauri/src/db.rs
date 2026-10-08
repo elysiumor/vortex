@@ -72,6 +72,39 @@ CREATE TABLE IF NOT EXISTS tmdb_details (
     json TEXT NOT NULL,
     fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- What TMDb said about a title, kept when its folder is removed. Keyed the way
+-- the scanner groups titles, so a folder added back finds its matches here
+-- instead of asking TMDb again. tmdb_id NULL: searched, nothing found.
+CREATE TABLE IF NOT EXISTS tmdb_memory (
+    kind TEXT NOT NULL,
+    sort_key TEXT NOT NULL,
+    tmdb_id INTEGER,
+    manual INTEGER NOT NULL DEFAULT 0,
+    poster TEXT,
+    overview TEXT,
+    rating REAL,
+    genres TEXT,
+    year INTEGER,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (kind, sort_key)
+);
+-- Full details by TMDb id, so they outlive the library title they were
+-- fetched for. Replaces tmdb_details, which went with its title.
+CREATE TABLE IF NOT EXISTS tmdb_cache (
+    kind TEXT NOT NULL,
+    tmdb_id INTEGER NOT NULL,
+    json TEXT NOT NULL,
+    fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (kind, tmdb_id)
+);
+-- A season's episode list by TMDb id: names, overviews, stills.
+CREATE TABLE IF NOT EXISTS tmdb_seasons (
+    tmdb_id INTEGER NOT NULL,
+    season INTEGER NOT NULL,
+    json TEXT NOT NULL,
+    fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (tmdb_id, season)
+);
 "#;
 
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {
@@ -110,6 +143,28 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
         "UPDATE media_items SET rating = (
             SELECT ROUND(json_extract(d.json, '$.vote_average'), 1) FROM tmdb_details d WHERE d.media_item_id = media_items.id
          ) WHERE rating IS NULL AND id IN (SELECT media_item_id FROM tmdb_details)",
+        [],
+    );
+    // Stores created before the year was kept.
+    let _ = conn.execute("ALTER TABLE tmdb_memory ADD COLUMN year INTEGER", []);
+    // Carry what is already known into the caches that outlive titles. All
+    // three are no-ops once done (OR IGNORE).
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO tmdb_cache (kind, tmdb_id, json, fetched_at)
+         SELECT m.kind, d.tmdb_id, d.json, d.fetched_at FROM tmdb_details d JOIN media_items m ON m.id = d.media_item_id",
+        [],
+    );
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO tmdb_memory (kind, sort_key, tmdb_id, poster, overview, rating, genres, year)
+         SELECT m.kind, m.sort_key, m.tmdb_id,
+                (SELECT json_extract(c.json, '$.poster_path') FROM tmdb_cache c WHERE c.kind = m.kind AND c.tmdb_id = m.tmdb_id),
+                m.overview, m.rating, m.genres, m.year
+         FROM media_items m WHERE m.tmdb_id IS NOT NULL",
+        [],
+    );
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO tmdb_memory (kind, sort_key, tmdb_id)
+         SELECT kind, sort_key, NULL FROM media_items WHERE tmdb_id IS NULL AND poster_checked = 1",
         [],
     );
     Ok(conn)
@@ -182,9 +237,13 @@ pub struct ContinueItem {
     pub tmdb_id: Option<i64>,
 }
 
+/// `available` is left false here: finding out means touching the file, and
+/// on a sleeping or disconnected drive that blocks for seconds, which inside
+/// a query held the database lock and froze every other command with it.
+/// Callers fill it in with `fill_available` after letting go of the lock.
 fn episode_from_row(r: &Row) -> rusqlite::Result<Episode> {
     let path: String = r.get("path")?;
-    let available = Path::new(&path).exists();
+    let available = false;
     Ok(Episode {
         id: r.get("id")?,
         media_item_id: r.get("media_item_id")?,
@@ -207,6 +266,19 @@ fn episode_from_row(r: &Row) -> rusqlite::Result<Episode> {
         available,
         path,
     })
+}
+
+/// Whether each episode's file is there. Call without the database lock held.
+/// A drive whose root is missing (unplugged, network share down) marks all of
+/// its files at once, without waiting on each one.
+pub fn fill_available<'a>(episodes: impl IntoIterator<Item = &'a mut Episode>) {
+    let mut roots: std::collections::HashMap<std::path::PathBuf, bool> = std::collections::HashMap::new();
+    for ep in episodes {
+        let path = Path::new(&ep.path);
+        let root = path.ancestors().last().unwrap_or(path).to_path_buf();
+        let drive_up = *roots.entry(root.clone()).or_insert_with(|| root.exists());
+        ep.available = drive_up && path.exists();
+    }
 }
 
 const EPISODE_SELECT: &str = r#"
@@ -565,22 +637,115 @@ pub fn set_episode_meta(
 
 // ---------- TMDB detail cache ----------
 
-pub fn get_details_json(conn: &Connection, media_item_id: i64) -> rusqlite::Result<Option<(i64, String, String)>> {
+/// Cached details and when they were fetched.
+pub fn get_details_json(conn: &Connection, kind: &str, tmdb_id: i64) -> rusqlite::Result<Option<(String, String)>> {
     conn.query_row(
-        "SELECT tmdb_id, json, fetched_at FROM tmdb_details WHERE media_item_id = ?1",
-        [media_item_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        "SELECT json, fetched_at FROM tmdb_cache WHERE kind = ?1 AND tmdb_id = ?2",
+        params![kind, tmdb_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )
     .optional()
 }
 
-pub fn set_details_json(conn: &Connection, media_item_id: i64, tmdb_id: i64, json: &str) -> rusqlite::Result<()> {
+pub fn set_details_json(conn: &Connection, kind: &str, tmdb_id: i64, json: &str) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO tmdb_details(media_item_id, tmdb_id, json, fetched_at) VALUES (?1, ?2, ?3, datetime('now'))
-         ON CONFLICT(media_item_id) DO UPDATE SET tmdb_id = excluded.tmdb_id, json = excluded.json, fetched_at = excluded.fetched_at",
-        params![media_item_id, tmdb_id, json],
+        "INSERT INTO tmdb_cache (kind, tmdb_id, json, fetched_at) VALUES (?1, ?2, ?3, datetime('now'))
+         ON CONFLICT(kind, tmdb_id) DO UPDATE SET json = excluded.json, fetched_at = excluded.fetched_at",
+        params![kind, tmdb_id, json],
     )?;
     Ok(())
+}
+
+pub fn get_season_json(conn: &Connection, tmdb_id: i64, season: i32) -> rusqlite::Result<Option<String>> {
+    conn.query_row("SELECT json FROM tmdb_seasons WHERE tmdb_id = ?1 AND season = ?2", params![tmdb_id, season], |r| r.get(0))
+        .optional()
+}
+
+pub fn set_season_json(conn: &Connection, tmdb_id: i64, season: i32, json: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO tmdb_seasons (tmdb_id, season, json, fetched_at) VALUES (?1, ?2, ?3, datetime('now'))
+         ON CONFLICT(tmdb_id, season) DO UPDATE SET json = excluded.json, fetched_at = excluded.fetched_at",
+        params![tmdb_id, season, json],
+    )?;
+    Ok(())
+}
+
+/// What the memory says about a title: Some(Some(id)) matched, Some(None)
+/// searched and not found, None never seen.
+pub struct Remembered {
+    pub tmdb_id: Option<i64>,
+    /// The library's year for the title when it was matched.
+    pub year: Option<i32>,
+    pub poster: Option<String>,
+    pub overview: Option<String>,
+    pub rating: Option<f64>,
+    pub genres: Option<String>,
+}
+
+pub fn remembered(conn: &Connection, kind: &str, sort_key: &str) -> rusqlite::Result<Option<Remembered>> {
+    conn.query_row(
+        "SELECT tmdb_id, poster, overview, rating, genres, year FROM tmdb_memory WHERE kind = ?1 AND sort_key = ?2",
+        params![kind, sort_key],
+        |r| Ok(Remembered { tmdb_id: r.get(0)?, poster: r.get(1)?, overview: r.get(2)?, rating: r.get(3)?, genres: r.get(4)?, year: r.get(5)? }),
+    )
+    .optional()
+}
+
+/// Remember an item's match. A match picked by hand is never replaced by an
+/// automatic one.
+pub fn remember_match(conn: &Connection, media_item_id: i64, poster: Option<&str>, manual: bool) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO tmdb_memory (kind, sort_key, tmdb_id, manual, poster, overview, rating, genres, year, updated_at)
+         SELECT kind, sort_key, tmdb_id, ?2, ?3, overview, rating, genres, year, datetime('now') FROM media_items
+         WHERE id = ?1 AND tmdb_id IS NOT NULL
+         ON CONFLICT(kind, sort_key) DO UPDATE SET
+            manual = CASE WHEN tmdb_memory.tmdb_id IS excluded.tmdb_id THEN MAX(tmdb_memory.manual, excluded.manual) ELSE excluded.manual END,
+            poster = CASE WHEN tmdb_memory.tmdb_id IS excluded.tmdb_id THEN COALESCE(excluded.poster, tmdb_memory.poster) ELSE excluded.poster END,
+            genres = CASE WHEN tmdb_memory.tmdb_id IS excluded.tmdb_id THEN COALESCE(excluded.genres, tmdb_memory.genres) ELSE excluded.genres END,
+            tmdb_id = excluded.tmdb_id, overview = excluded.overview, rating = excluded.rating,
+            year = COALESCE(excluded.year, tmdb_memory.year), updated_at = excluded.updated_at
+         WHERE excluded.manual = 1 OR tmdb_memory.manual = 0 OR tmdb_memory.tmdb_id IS excluded.tmdb_id",
+        params![media_item_id, manual as i64, poster],
+    )?;
+    Ok(())
+}
+
+/// Remember that TMDb had nothing for this title, unless a match is known.
+pub fn remember_not_found(conn: &Connection, media_item_id: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO tmdb_memory (kind, sort_key, tmdb_id) SELECT kind, sort_key, NULL FROM media_items WHERE id = ?1
+         ON CONFLICT(kind, sort_key) DO NOTHING",
+        [media_item_id],
+    )?;
+    Ok(())
+}
+
+/// Keep what is remembered under a title's old key when it gets a new one
+/// (a TMDb rename changes the name the scanner reads).
+pub fn rekey_memory(conn: &Connection, kind: &str, old_key: &str, new_key: &str) -> rusqlite::Result<()> {
+    if old_key == new_key {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT OR REPLACE INTO tmdb_memory (kind, sort_key, tmdb_id, manual, poster, overview, rating, genres, updated_at)
+         SELECT kind, ?3, tmdb_id, manual, poster, overview, rating, genres, updated_at FROM tmdb_memory WHERE kind = ?1 AND sort_key = ?2",
+        params![kind, old_key, new_key],
+    )?;
+    Ok(())
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct TmdbStore {
+    pub titles: i64,
+    pub details: i64,
+    pub images: i64,
+    pub image_bytes: u64,
+}
+
+pub fn tmdb_store_counts(conn: &Connection) -> rusqlite::Result<(i64, i64)> {
+    let titles = conn.query_row("SELECT COUNT(*) FROM tmdb_memory WHERE tmdb_id IS NOT NULL", [], |r| r.get(0))?;
+    let details = conn.query_row("SELECT COUNT(*) FROM tmdb_cache", [], |r| r.get(0))?;
+    Ok((titles, details))
 }
 
 // ---------- history ----------
@@ -902,13 +1067,13 @@ pub fn attach_tmdb_collection(
 /// Titles whose cached TMDB details mention a collection but which are not in one yet.
 pub fn backfill_tmdb_collections(conn: &Connection) -> rusqlite::Result<usize> {
     let mut stmt = conn.prepare(
-        "SELECT d.media_item_id,
+        "SELECT m.id,
                 json_extract(d.json, '$.belongs_to_collection.id'),
                 json_extract(d.json, '$.belongs_to_collection.name'),
                 json_extract(d.json, '$.belongs_to_collection.poster_path')
-         FROM tmdb_details d
+         FROM media_items m JOIN tmdb_cache d ON d.kind = m.kind AND d.tmdb_id = m.tmdb_id
          WHERE json_extract(d.json, '$.belongs_to_collection.id') IS NOT NULL
-           AND d.media_item_id NOT IN (
+           AND m.id NOT IN (
                 SELECT it.media_item_id FROM item_tags it JOIN tags t ON t.id = it.tag_id WHERE t.kind = 'collection')",
     )?;
     let rows: Vec<(i64, i64, String, Option<String>)> = stmt
@@ -1051,6 +1216,12 @@ pub fn mark_poster_checked(conn: &Connection, id: i64) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// The poster file for an item that is already matched; marks it checked.
+pub fn set_poster(conn: &Connection, id: i64, poster_path: Option<&str>) -> rusqlite::Result<()> {
+    conn.execute("UPDATE media_items SET poster_path = COALESCE(?2, poster_path), poster_checked = 1 WHERE id = ?1", params![id, poster_path])?;
+    Ok(())
+}
+
 pub fn clear_poster_checked(conn: &Connection, id: i64) -> rusqlite::Result<()> {
     conn.execute("UPDATE media_items SET poster_checked = 0 WHERE id = ?1", [id])?;
     Ok(())
@@ -1112,7 +1283,8 @@ pub fn next_episode(conn: &Connection, episode_id: i64) -> rusqlite::Result<Opti
     }
     let all: Vec<Episode> = list_episodes(conn, ep.media_item_id)?.into_iter().filter(|e| e.extra.is_none()).collect();
     let pos = all.iter().position(|e| e.id == ep.id).unwrap_or(all.len());
-    Ok(all.into_iter().skip(pos + 1).find(|e| e.available))
+    // Few files to touch here, all from a show that is playing right now.
+    Ok(all.into_iter().skip(pos + 1).find(|e| Path::new(&e.path).exists()))
 }
 
 /// Items the user is part-way through, plus the "next up" episode for series
@@ -1298,6 +1470,49 @@ mod tests {
         // Every session is still on record for the statistics.
         let sessions: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |r| r.get(0)).unwrap();
         assert_eq!(sessions, 3);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A folder removed and added back finds its titles' TMDb data in the
+    /// memory instead of asking TMDb again; a hand-picked match survives.
+    #[test]
+    fn tmdb_matches_are_remembered_across_folder_switches() {
+        let (conn, path) = temp_db();
+        let lib = add_library(&conn, r"F:\Films").unwrap();
+        conn.execute("INSERT INTO media_items (id, kind, title, sort_key) VALUES (1, 'movie', 'Heat', 'heat')", []).unwrap();
+        conn.execute("INSERT INTO media_items (id, kind, title, sort_key) VALUES (2, 'movie', 'Home Video', 'homevideo')", []).unwrap();
+        for (id, item) in [(1i64, 1i64), (2, 2)] {
+            conn.execute(
+                "INSERT INTO episodes (id, media_item_id, library_id, path, file_name, size, modified) VALUES (?1, ?2, ?3, ?4, 'f.mkv', 1, 1)",
+                params![id, item, lib.id, format!(r"F:\Films\{id}.mkv")],
+            )
+            .unwrap();
+        }
+        // Fix match picked 949 by hand; the home video was searched and not found.
+        set_tmdb(&conn, 1, Some(949), Some(r"C:\posters\movie-949.jpg"), Some("A heist."), Some(7.9)).unwrap();
+        remember_match(&conn, 1, Some("/heat.jpg"), true).unwrap();
+        remember_not_found(&conn, 2).unwrap();
+        // An automatic match later cannot replace the hand-picked one.
+        conn.execute("UPDATE media_items SET tmdb_id = 1234 WHERE id = 1", []).unwrap();
+        remember_match(&conn, 1, None, false).unwrap();
+
+        // The folder goes, and its titles with it.
+        remove_library(&conn, lib.id).unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM media_items", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+
+        let heat = remembered(&conn, "movie", "heat").unwrap().expect("remembered after removal");
+        assert_eq!(heat.tmdb_id, Some(949), "the hand-picked match wins");
+        assert_eq!(heat.poster.as_deref(), Some("/heat.jpg"));
+        assert_eq!(heat.overview.as_deref(), Some("A heist."));
+        let home = remembered(&conn, "movie", "homevideo").unwrap().expect("not-found is remembered too");
+        assert_eq!(home.tmdb_id, None);
+        assert!(remembered(&conn, "movie", "never-seen").unwrap().is_none());
+
+        // Renamed to TMDb's name: the memory follows the new key.
+        rekey_memory(&conn, "movie", "heat", "heat1995").unwrap();
+        assert_eq!(remembered(&conn, "movie", "heat1995").unwrap().and_then(|r| r.tmdb_id), Some(949));
 
         drop(conn);
         let _ = std::fs::remove_file(&path);

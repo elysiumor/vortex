@@ -137,29 +137,61 @@ fn stems_for(paths: &[&str], base: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether files sharing a folder differ by a part number or a quality, the
+/// way `stems_for` names them, rather than only by a counter.
+fn told_apart(paths: &[&str]) -> bool {
+    let parts: Vec<Option<String>> = paths.iter().map(|p| PART.captures(&stem(Path::new(p))).map(|c| c[1].to_string())).collect();
+    let qualities: Vec<Option<String>> = paths.iter().map(|p| QUALITY.captures(&file_name(Path::new(p))).map(|c| c[1].to_lowercase())).collect();
+    let distinct = |v: &[Option<String>]| v.iter().all(Option::is_some) && v.iter().collect::<HashSet<_>>().len() == v.len();
+    distinct(&parts) || distinct(&qualities)
+}
+
 /// Files in `dir` named after `video` ("Movie.en.srt", "Movie.nfo"), with the
 /// rest of their name after the video's stem. A file that also matches a
 /// longer stem of another video in the folder belongs to that one.
-fn sidecars(video: &Path, all_stems: &[String]) -> Vec<(PathBuf, String)> {
+fn sidecars(video: &Path) -> Vec<(PathBuf, String)> {
     let Some(dir) = video.parent() else { return Vec::new() };
-    let own = stem(video).to_lowercase();
+    let own = stem(video);
+    let all_stems = video_stems_in(dir);
     let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
     rd.flatten()
         .map(|e| e.path())
         .filter(|p| p.is_file() && !parser::is_video(p))
         .filter_map(|p| {
             let name = file_name(&p);
-            let lower = name.to_lowercase();
-            if !lower.starts_with(&format!("{own}.")) {
-                return None;
-            }
-            let longer = all_stems.iter().any(|s| {
-                let s = s.to_lowercase();
-                s.len() > own.len() && lower.starts_with(&format!("{s}."))
-            });
-            (!longer).then(|| (p.clone(), name[own.len()..].to_string()))
+            let rest = named_after(&name, &own)?;
+            // "It.Follows.en.srt" starts with "It." too; it belongs to the
+            // longer name, whether or not that video is being renamed.
+            let longer = all_stems.iter().any(|s| s.chars().count() > own.chars().count() && named_after(&name, s).is_some());
+            (!longer).then(|| (p.clone(), rest))
         })
         .collect()
+}
+
+/// What follows `stem` in `name`, if `name` starts with it (ignoring case)
+/// and the stem ends there: "Movie.en.srt" and "Movie_eng.srt" are named after
+/// "Movie", "Movies.txt" is not. Compared character by character, since
+/// lowercasing can change a name's length in bytes ("İ").
+fn named_after(name: &str, stem: &str) -> Option<String> {
+    let mut chars = name.chars();
+    for s in stem.chars() {
+        let c = chars.next()?;
+        if !c.to_lowercase().eq(s.to_lowercase()) {
+            return None;
+        }
+    }
+    let rest: String = chars.collect();
+    match rest.chars().next() {
+        Some(c) if !c.is_alphanumeric() => Some(rest),
+        _ => None,
+    }
+}
+
+/// Stems of every video file in a folder, this title's or not.
+fn video_stems_in(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.is_file() && parser::is_video(p)).map(|p| stem(&p)).collect())
+        .unwrap_or_default()
 }
 
 /// What TMDb says about a matched title: its name and year, and for a series
@@ -174,14 +206,14 @@ struct TmdbInfo {
 
 /// From the cached details when there are any (no network for a
 /// whole-library preview), else fetched.
-fn tmdb_info(app: &AppHandle, media_item_id: i64, tmdb_id: i64) -> Result<Option<TmdbInfo>, String> {
+fn tmdb_info(app: &AppHandle, media_item_id: i64, kind: &str, tmdb_id: i64) -> Result<Option<TmdbInfo>, String> {
     let cached = {
         let state = app.state::<AppState>();
         let conn = state.db.lock().map_err(|e| e.to_string())?;
-        db::get_details_json(&conn, media_item_id).map_err(|e| e.to_string())?
+        db::get_details_json(&conn, kind, tmdb_id).map_err(|e| e.to_string())?
     };
     let year_of = |d: &str| d.get(..4).and_then(|y| y.parse::<i32>().ok());
-    if let Some((_, json, _)) = cached.filter(|(cached_id, _, _)| *cached_id == tmdb_id) {
+    if let Some((json, _)) = cached {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
             let title = v["title"].as_str().or(v["name"].as_str()).map(str::to_string);
             let date = v["release_date"].as_str().or(v["first_air_date"].as_str()).unwrap_or("");
@@ -230,9 +262,11 @@ fn plan_into(app: &AppHandle, plan: &mut Plan) -> Result<(), String> {
         let roots: Vec<String> = db::list_libraries_rows(&conn).map_err(|e| e.to_string())?.into_iter().map(|l| l.path).collect();
         (item, episodes, roots)
     };
+    let mut episodes = episodes;
+    db::fill_available(episodes.iter_mut());
     plan.title = item.title.clone();
     let tmdb_id = item.tmdb_id.ok_or("Not matched to TMDb. Use Fix match first.")?;
-    let info = tmdb_info(app, id, tmdb_id)?.ok_or("No TMDb details for this title.")?;
+    let info = tmdb_info(app, id, &item.kind, tmdb_id)?.ok_or("No TMDb details for this title.")?;
     let base = base_name(&info.title, info.year);
     if base.is_empty() {
         return Err("TMDb's title has no usable characters.".into());
@@ -246,6 +280,7 @@ fn plan_into(app: &AppHandle, plan: &mut Plan) -> Result<(), String> {
         other => return Err(format!("Cannot rename a {other}.")),
     };
     moves.retain(|m| m.from != m.to);
+    reads_back(app, &item, &info, &roots, &moves)?;
 
     // Collisions: two files aiming at one name, or a name already taken.
     let mut targets = HashSet::new();
@@ -279,9 +314,6 @@ fn movie_moves(
     if main.is_empty() {
         return Err("No movie file.".into());
     }
-    // Every main file's stem, so a subtitle is matched to its own video even
-    // when that video is not being renamed.
-    let all_stems: Vec<String> = main.iter().map(|e| stem(Path::new(&e.path))).collect();
     // Titles are grouped by name alone, so a remake can sit with the original
     // ("Dune" 1984 and 2021). A file whose own name carries a year more than
     // one off TMDb's is another film: it keeps its name, and no folder is
@@ -317,7 +349,7 @@ fn movie_moves(
         files.sort_by(|a, b| a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase()));
         let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
         for (f, new_stem) in files.iter().zip(stems_for(&paths, base)) {
-            push_file(&mut moves, Path::new(&f.path), &new_stem, &all_stems);
+            push_file(&mut moves, Path::new(&f.path), &new_stem);
         }
     }
 
@@ -332,8 +364,8 @@ fn movie_moves(
 }
 
 /// A video and its sidecars, renamed to `new_stem` in the same folder.
-fn push_file(moves: &mut Vec<Move>, from: &Path, new_stem: &str, all_stems: &[String]) {
-    for (side, rest) in sidecars(from, all_stems) {
+fn push_file(moves: &mut Vec<Move>, from: &Path, new_stem: &str) {
+    for (side, rest) in sidecars(from) {
         moves.push(Move {
             from: side.to_string_lossy().into(),
             to: side.with_file_name(format!("{new_stem}{rest}")).to_string_lossy().into(),
@@ -347,10 +379,15 @@ fn push_file(moves: &mut Vec<Move>, from: &Path, new_stem: &str, all_stems: &[St
 /// Rename the title's own folder to `base`, when it is named after the title
 /// (a category folder holding one film, "Movies", keeps its name), is not a
 /// library, and holds nothing of any other title.
-fn own_folder_move(app: &AppHandle, dir: &Path, item: &db::MediaItem, info: &TmdbInfo, roots: &[String], base: &str) -> Result<Option<Move>, String> {
+/// A folder whose name reads as this title ("Inception.2010.1080p" for
+/// Inception), as opposed to a category or library folder ("Movies", "TV").
+fn named_after_title(dir: &Path, item: &db::MediaItem, info: &TmdbInfo) -> bool {
     let (folder_title, _) = parser::folder_title_of(&file_name(dir));
-    let named_after = names_agree(&folder_title, &item.title) || names_agree(&folder_title, &info.title);
-    if !named_after || file_name(dir) == base || !folder_is_own(app, dir, item.id, roots)? {
+    names_agree(&folder_title, &item.title) || names_agree(&folder_title, &info.title)
+}
+
+fn own_folder_move(app: &AppHandle, dir: &Path, item: &db::MediaItem, info: &TmdbInfo, roots: &[String], base: &str) -> Result<Option<Move>, String> {
+    if !named_after_title(dir, item, info) || file_name(dir) == base || !folder_is_own(app, dir, item.id, roots)? {
         return Ok(None);
     }
     let new_dir = dir.with_file_name(base);
@@ -447,7 +484,6 @@ fn series_moves(app: &AppHandle, item: &db::MediaItem, episodes: &[db::Episode],
 
     // New names, then told apart within each folder where two copies of one
     // episode would collide.
-    let all_stems: Vec<String> = main.iter().map(|e| stem(Path::new(&e.path))).collect();
     let mut groups: HashMap<(PathBuf, String), Vec<&db::Episode>> = HashMap::new();
     for &(e, s, ep, last) in &placed {
         let code = match last {
@@ -470,8 +506,16 @@ fn series_moves(app: &AppHandle, item: &db::MediaItem, episodes: &[db::Episode],
     for ((_, new_stem), mut files) in groups {
         files.sort_by(|a, b| a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase()));
         let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        // Two files for one episode that only a counter could tell apart are
+        // more likely a numbering mix-up than two copies; do not guess.
+        if paths.len() > 1 && !told_apart(&paths) {
+            return Err(format!(
+                "{} would all become {new_stem}. Nothing in this series was renamed; check their numbering.",
+                files.iter().map(|f| f.file_name.as_str()).collect::<Vec<_>>().join(", ")
+            ));
+        }
         for (f, s) in files.iter().zip(stems_for(&paths, &new_stem)) {
-            push_file(&mut moves, Path::new(&f.path), &s, &all_stems);
+            push_file(&mut moves, Path::new(&f.path), &s);
         }
     }
     moves.sort_by(|a, b| a.from.to_lowercase().cmp(&b.from.to_lowercase()));
@@ -486,6 +530,12 @@ fn series_moves(app: &AppHandle, item: &db::MediaItem, episodes: &[db::Episode],
     let mut season_moves: Vec<Move> = Vec::new();
     for (dir, seasons) in &seasons_in {
         if seasons.len() != 1 || !parser::is_season_dir(&file_name(dir)) {
+            continue;
+        }
+        // Only inside the show's own folder. "The.Bear.S03.1080p" sitting
+        // directly in "TV" is the only folder carrying the show's name;
+        // renaming it to "Season 03" would lose that.
+        if !dir.parent().map(|p| named_after_title(p, item, info)).unwrap_or(false) {
             continue;
         }
         let s = seasons.iter().next().copied().unwrap_or(0);
@@ -529,6 +579,45 @@ fn series_moves(app: &AppHandle, item: &db::MediaItem, episodes: &[db::Episode],
     Ok(moves)
 }
 
+/// The new name must read back as this same title on the next scan. If it
+/// reads as another kind, another year, or lands on a different title already
+/// in the library ("Gojira" renamed to "Godzilla (1954)" beside "Godzilla
+/// (2014)"), the scan would merge two films; refuse instead.
+fn reads_back(app: &AppHandle, item: &db::MediaItem, info: &TmdbInfo, roots: &[String], moves: &[Move]) -> Result<(), String> {
+    let Some(video) = moves.iter().find(|m| !m.folder && parser::is_video(Path::new(&m.to))) else { return Ok(()) };
+    let path = final_path(&video.to, moves);
+    let lower = path.to_lowercase();
+    let root = roots
+        .iter()
+        .filter(|r| lower.starts_with(&format!("{}{}", r.trim_end_matches(['\\', '/']).to_lowercase(), std::path::MAIN_SEPARATOR)))
+        .max_by_key(|r| r.len());
+    let Some(root) = root else { return Ok(()) };
+    let parsed = parser::parse(Path::new(&path), Path::new(root));
+    let kind_ok = matches!((item.kind.as_str(), parsed.kind), ("movie", parser::Kind::Movie) | ("series", parser::Kind::Series));
+    let year_ok = item.kind != "movie" || info.year.is_none() || parsed.year == info.year;
+    if !kind_ok || !year_ok || parsed.title.is_empty() {
+        return Err(format!("The new name would read back as \"{}\"{}, not as this title.", parsed.title, parsed.year.map(|y| format!(" ({y})")).unwrap_or_default()));
+    }
+    let key = parser::sort_key(&parsed.title);
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let other: Option<(String, Option<i32>)> = conn
+        .query_row(
+            "SELECT title, year FROM media_items WHERE kind = ?1 AND sort_key = ?2 AND id != ?3",
+            params![item.kind, key, item.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if let Some((title, year)) = other {
+        return Err(format!(
+            "After renaming it would be filed together with \"{title}\"{} already in your library. Rename that one first, or check the match.",
+            year.map(|y| format!(" ({y})")).unwrap_or_default()
+        ));
+    }
+    Ok(())
+}
+
 /// "Inception" and "Inception 2010 1080p" name the same film; "Movies" does not.
 fn names_agree(a: &str, b: &str) -> bool {
     let (ka, kb) = (parser::sort_key(a), parser::sort_key(b));
@@ -550,7 +639,14 @@ fn final_path(path: &str, moves: &[Move]) -> String {
 /// A folder may be renamed only when nothing else lives in it: it is not a
 /// library itself, and no other title has files under it.
 fn folder_is_own(app: &AppHandle, dir: &Path, media_item_id: i64, roots: &[String]) -> Result<bool, String> {
-    if dir.parent().is_none() || roots.iter().any(|r| same_path(Path::new(r.trim_end_matches(['\\', '/'])), dir)) {
+    // Not a library, and not a folder a library sits in: renaming it would
+    // leave that library pointing at a folder that is gone.
+    let dir_key = format!("{}{}", dir.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase(), std::path::MAIN_SEPARATOR);
+    let holds_library = roots.iter().any(|r| {
+        let root_key = format!("{}{}", r.trim_end_matches(['\\', '/']).to_lowercase(), std::path::MAIN_SEPARATOR);
+        root_key.starts_with(&dir_key)
+    });
+    if dir.parent().is_none() || holds_library {
         return Ok(false);
     }
     let state = app.state::<AppState>();
@@ -648,6 +744,19 @@ pub fn can_undo(app: &AppHandle) -> bool {
 /// rename was made from it.
 fn carry_out(app: &AppHandle, moves: &[Move], display: Option<(i64, &str)>) -> Result<(), String> {
     rename_on_disk(moves)?;
+    if let Err(e) = update_library(app, moves, display) {
+        // The files moved but the library could not follow: put them back,
+        // or the next scan would see new names and split the title.
+        let back: Vec<Move> = moves.iter().rev().map(|m| Move { from: m.to.clone(), to: m.from.clone(), folder: m.folder }).collect();
+        return match rename_on_disk(&back) {
+            Ok(()) => Err(format!("the library could not be updated ({e}); the files were put back")),
+            Err(undo) => Err(format!("the library could not be updated ({e}), and putting the files back failed: {undo}")),
+        };
+    }
+    Ok(())
+}
+
+fn update_library(app: &AppHandle, moves: &[Move], display: Option<(i64, &str)>) -> Result<(), String> {
     let state = app.state::<AppState>();
     let mut conn = state.db.lock().map_err(|e| e.to_string())?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
@@ -676,10 +785,11 @@ fn rename_on_disk(moves: &[Move]) -> Result<(), String> {
         let blocked = to.exists() && !same_path(from, to);
         let result = if blocked { Err(format!("{} already exists", m.to)) } else { std::fs::rename(from, to).map_err(|e| e.to_string()) };
         if let Err(e) = result {
-            for d in done.iter().rev() {
-                let _ = std::fs::rename(&d.to, &d.from);
+            let stuck: Vec<String> = done.iter().rev().filter(|d| std::fs::rename(&d.to, &d.from).is_err()).map(|d| d.to.clone()).collect();
+            if stuck.is_empty() {
+                return Err(format!("{}: {e}", file_name(from)));
             }
-            return Err(format!("{}: {e}", file_name(from)));
+            return Err(format!("{}: {e}; could not put back: {}", file_name(from), stuck.join(", ")));
         }
         done.push(m);
     }
@@ -736,12 +846,18 @@ fn resync_title(conn: &Connection, media_item_id: i64, display: Option<&str>, pr
     // TMDb's own spelling ("Mission: Impossible") when it keys the same as the
     // file name it became; the year is left as it was.
     let title = display.filter(|d| parser::sort_key(d) == key).unwrap_or(&parsed.title);
+    // What TMDb said is remembered under the title's key; carry it over so a
+    // folder switched back in later still finds it under the new name.
+    let old_key: String = conn.query_row("SELECT sort_key FROM media_items WHERE id = ?1", [media_item_id], |r| r.get(0))?;
     // OR IGNORE: another title already holding that key means the next scan
-    // merges the two, which is what should happen to two copies of one film.
-    conn.execute(
+    // merges the two (the plan refuses that case for different films).
+    let changed = conn.execute(
         "UPDATE OR IGNORE media_items SET title = ?2, sort_key = ?3 WHERE id = ?1",
         params![media_item_id, title, key],
     )?;
+    if changed == 1 {
+        db::rekey_memory(conn, &kind, &old_key, &key)?;
+    }
     Ok(())
 }
 
@@ -854,13 +970,22 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("vortex-rename-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        for f in ["Movie.mkv", "Movie.en.srt", "Movie.nfo", "Movie.Extended.mkv", "Movie.Extended.srt", "Other.srt"] {
+        for f in [
+            "Movie.mkv", "Movie.en.srt", "Movie_eng.srt", "Movie.nfo", "Movie.Extended.mkv", "Movie.Extended.srt", "Movies.txt", "Other.srt",
+            "It.mkv", "It.Follows.mkv", "It.Follows.en.srt", "Italian.Job.srt",
+        ] {
             std::fs::write(dir.join(f), b"x").unwrap();
         }
-        let stems = vec!["Movie".to_string(), "Movie.Extended".to_string()];
-        let mut found: Vec<String> = sidecars(&dir.join("Movie.mkv"), &stems).into_iter().map(|(_, rest)| rest).collect();
-        found.sort();
-        assert_eq!(found, vec![".en.srt", ".nfo"], "the Extended cut's subtitle stays with the Extended cut");
+        let found = |video: &str| {
+            let mut v: Vec<String> = sidecars(&dir.join(video)).into_iter().map(|(_, rest)| rest).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(found("Movie.mkv"), vec![".en.srt", ".nfo", "_eng.srt"], "the Extended cut's subtitle stays with the Extended cut; Movies.txt is another name");
+        assert!(found("It.mkv").is_empty(), "It.Follows' subtitle and Italian.Job.srt are not It's");
+        // Lowercasing "İ" adds a byte; the rest of the name must still be cut at the right place.
+        assert_eq!(named_after("İstanbul.en.srt", "İstanbul").as_deref(), Some(".en.srt"));
+        assert_eq!(named_after("istanbul.en.srt", "İstanbul"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

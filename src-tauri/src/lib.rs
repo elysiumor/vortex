@@ -92,6 +92,7 @@ pub fn run() {
 
             let handle = app.handle().clone();
             logging::startup_summary(&handle);
+            tmdb::migrate_image_names(&handle);
             tray::build(&handle)?;
             if jobs::setting_on(&handle, "rescan_on_startup", true) {
                 jobs::refresh_async(handle.clone(), "startup");
@@ -141,6 +142,7 @@ pub fn run() {
             commands::reveal_path,
             commands::probe_durations,
             commands::detect_ffprobe,
+            commands::tmdb_store,
             commands::rename_preview,
             commands::rename_apply,
             commands::rename_undo,

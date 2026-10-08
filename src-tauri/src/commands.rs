@@ -100,16 +100,34 @@ pub fn get_media_item(state: State<AppState>, id: i64) -> R<Option<MediaItem>> {
     db::get_media_item(&conn, id).map_err(err)
 }
 
-#[tauri::command]
-pub fn list_episodes(state: State<AppState>, media_item_id: i64) -> R<Vec<Episode>> {
-    let conn = state.db.lock().map_err(err)?;
-    db::list_episodes(&conn, media_item_id).map_err(err)
+/// Read under the database lock, then check the files with the lock
+/// released and off the main thread: touching a file on a sleeping drive
+/// takes seconds, and these used to freeze the whole window meanwhile.
+async fn read_then_check<T: Send + 'static>(
+    app: AppHandle,
+    read: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T> + Send + 'static,
+    check: impl FnOnce(&mut T) + Send + 'static,
+) -> R<T> {
+    blocking(move || {
+        let mut out = {
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().map_err(err)?;
+            read(&conn).map_err(err)?
+        };
+        check(&mut out);
+        Ok(out)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn continue_watching(state: State<AppState>) -> R<Vec<ContinueItem>> {
-    let conn = state.db.lock().map_err(err)?;
-    db::continue_watching(&conn, 20).map_err(err)
+pub async fn list_episodes(app: AppHandle, media_item_id: i64) -> R<Vec<Episode>> {
+    read_then_check(app, move |c| db::list_episodes(c, media_item_id), |eps| db::fill_available(eps.iter_mut())).await
+}
+
+#[tauri::command]
+pub async fn continue_watching(app: AppHandle) -> R<Vec<ContinueItem>> {
+    read_then_check(app, |c| db::continue_watching(c, 20), |items| db::fill_available(items.iter_mut().map(|i| &mut i.episode))).await
 }
 
 // ---- progress ----
@@ -127,9 +145,9 @@ pub fn set_progress(state: State<AppState>, episode_id: i64, position_secs: i64,
 // ---- history ----
 
 #[tauri::command]
-pub fn list_history(state: State<AppState>, limit: Option<i64>) -> R<Vec<HistoryEntry>> {
-    let conn = state.db.lock().map_err(err)?;
-    db::list_history(&conn, limit.unwrap_or(300)).map_err(err)
+pub async fn list_history(app: AppHandle, limit: Option<i64>) -> R<Vec<HistoryEntry>> {
+    let limit = limit.unwrap_or(300);
+    read_then_check(app, move |c| db::list_history(c, limit), |h| db::fill_available(h.iter_mut().map(|e| &mut e.episode))).await
 }
 
 #[tauri::command]
@@ -153,9 +171,8 @@ pub fn clear_history(state: State<AppState>) -> R<()> {
 // ---- duplicates ----
 
 #[tauri::command]
-pub fn find_duplicates(state: State<AppState>) -> R<Vec<DuplicateGroup>> {
-    let conn = state.db.lock().map_err(err)?;
-    db::find_duplicates(&conn).map_err(err)
+pub async fn find_duplicates(app: AppHandle) -> R<Vec<DuplicateGroup>> {
+    read_then_check(app, db::find_duplicates, |groups| db::fill_available(groups.iter_mut().flat_map(|g| g.files.iter_mut()))).await
 }
 
 /// Move a file to the Recycle Bin and drop it from the library.
@@ -294,12 +311,18 @@ pub async fn search_tmdb(app: AppHandle, kind: String, query: String, year: Opti
 
 #[tauri::command]
 pub async fn apply_tmdb_match(app: AppHandle, media_item_id: i64, m: TmdbMatch) -> R<()> {
-    blocking(move || tmdb::apply_match(&app, media_item_id, &m)).await
+    blocking(move || tmdb::apply_match(&app, media_item_id, &m, true)).await
 }
 
 #[tauri::command]
 pub async fn get_details(app: AppHandle, media_item_id: i64, refresh: bool) -> R<Option<Details>> {
     blocking(move || tmdb::get_details(&app, media_item_id, refresh)).await
+}
+
+/// How much TMDb data is kept locally, for Settings.
+#[tauri::command]
+pub async fn tmdb_store(app: AppHandle) -> R<db::TmdbStore> {
+    blocking(move || tmdb::store_stats(&app)).await
 }
 
 // ---- rename to TMDb names ----
@@ -327,13 +350,12 @@ pub async fn rename_can_undo(app: AppHandle) -> R<bool> {
 
 #[tauri::command]
 pub async fn fetch_episode_titles(app: AppHandle, media_item_id: i64) -> R<usize> {
-    blocking(move || tmdb::fetch_episode_titles(&app, media_item_id)).await
+    blocking(move || tmdb::fetch_episode_titles(&app, media_item_id, true)).await
 }
 
 #[tauri::command]
-pub fn search(state: State<AppState>, query: String) -> R<SearchResults> {
-    let conn = state.db.lock().map_err(err)?;
-    db::search(&conn, &query).map_err(err)
+pub async fn search(app: AppHandle, query: String) -> R<SearchResults> {
+    read_then_check(app, move |c| db::search(c, &query), |r| db::fill_available(r.episodes.iter_mut().map(|h| &mut h.episode))).await
 }
 
 #[tauri::command]
