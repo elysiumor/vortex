@@ -6,18 +6,21 @@ The backlog, in three lists. Each item links its spec once it has one. How items
 
 | Item | Spec | Notes |
 | --- | --- | --- |
-| Sync button, automatic refresh after renames, and a 0–100 % status for background work (scan, posters, rename, durations) | [014](../specs/014-sync-and-job-status/spec.md) | Being built in a separate session; combine when it finishes. Also answers "the title page goes blank after a rename" and "it keeps fetching after a bulk rename". |
-| Confirm before removing a library folder | [015](../specs/015-library-remove-confirm/spec.md) | Draft. Also check why the Remove button isn't seen in the installed build. |
-| Remakes as separate titles (Dune 1984 / 2021) | [016](../specs/016-remakes-as-separate-titles/spec.md) | Draft. A session proposal exists. |
+| Remakes as separate titles (Dune 1984 / 2021) | [016](../specs/016-remakes-as-separate-titles/spec.md) | Draft; two open questions for the product owner. A session proposal exists. |
+| Installed-build check of 1.1.11 | [014](../specs/014-sync-and-job-status/tasks.md), [015](../specs/015-library-remove-confirm/tasks.md), [017](../specs/017-tmdb-page-and-options/tasks.md) | Acceptance criteria were checked in the dev build; the product owner's confirmation on the installed build is pending. |
 
 ## Next
 
 | Item | Notes |
 | --- | --- |
+| Status pill in narrow windows | Hidden below the `lg` breakpoint; only the Sync icon spins there. |
+| Match scoring | Automatic matching takes the first search result; a title-similarity or "prefer exact title" rule would cut Fix match work. |
+| Re-download images when a size changes | Sizes apply only to images fetched afterwards. |
 | Retry files whose duration could not be read | `duration_checked` is never cleared; "Read missing" skips them. |
 | Smart list "to year" input | The field exists in the saved list, the dialog has no input for it. |
 | Collection descriptions | `tags.overview` is never filled; TMDb collections have one. |
 | Search cast and crew | The search box promises "people"; only titles, episode titles and file names are searched. |
+| Forget TMDb data when removing a library | Open question from spec 015. |
 | Torrent polish: seed-ratio limit, scheduling | Phase 4 of the downloads plan; bandwidth caps are done. Must stay within the proxy-mode rules (D-006). |
 | Faster "Apply" for download settings | The engine restart pauses about a second (librqbit). |
 
@@ -47,3 +50,7 @@ The backlog, in three lists. Each item links its spec once it has one. How items
 | 1.1.9 (2026-10-08) | TMDb data kept across folder switches | [012](../specs/012-tmdb-data-across-folder-switches/spec.md) |
 | 1.1.9 (2026-10-08) | UI redesign: light and dark, carousel rows, Ctrl+K | [013](../specs/013-ui-redesign/spec.md) |
 | 1.1.10 (2026-10-08) | VLC single-instance tracking | [002](../specs/002-playback-and-resume/spec.md) (amendment) |
+| 1.1.11 (2026-10-08) | Sync button, status pill with 0–100 %, title page follows its files, Stop for the poster fetch | [014](../specs/014-sync-and-job-status/spec.md) |
+| 1.1.11 | Confirm before removing a library folder, file count per library | [015](../specs/015-library-remove-confirm/spec.md) |
+| 1.1.11 | TMDb page: matching rules, API options, adult titles, unmatched list | [017](../specs/017-tmdb-page-and-options/spec.md) |
+| 1.1.11 | Content Security Policy | [010](../specs/010-logging-and-diagnostics/spec.md) (amendment, D-017) |

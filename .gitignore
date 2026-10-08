@@ -23,5 +23,7 @@ dist-ssr
 *.sln
 *.sw?
 
-# Local dev-server config for the Claude Code browser pane
-.claude/
+# Local dev-server config for the Claude Code browser pane; the project
+# skills (spec, spec-plan, spec-build) are part of the repository.
+.claude/*
+!.claude/skills/

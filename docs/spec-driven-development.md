@@ -90,7 +90,7 @@ Work through `tasks.md` in order and tick tasks off as they're done. Set the spe
 
 Verify every acceptance criterion before calling the work done:
 
-- `cd src-tauri && cargo test -j 2` passes, and `pnpm build` (which runs `vue-tsc --noEmit`) passes.
+- `cd src-tauri && cargo test -j 1` passes (`-j 2` has crashed rustc when memory was short), and `pnpm build` (which runs `vue-tsc --noEmit`) passes.
 - Each acceptance criterion is checked in the running app (`pnpm tauri dev`, or the installed build) against a real library, in light and dark where the UI changed. Record how each one was checked in the Verification section of `tasks.md`.
 - Rules in Rust (parsing, grouping, renaming, placement, the status machines) get a unit test next to the existing ones.
 - A release build (`CARGO_BUILD_JOBS=2 pnpm tauri build`) is made only when nothing else is compiling, and its installer timestamps are checked before the paths are handed over. The product owner installs and tests it; installers are never published to GitHub.
