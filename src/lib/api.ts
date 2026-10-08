@@ -113,8 +113,35 @@ export function subtitleCount(ep: Episode): number {
 }
 
 export interface ScanDone {
-  reason: "startup" | "watch" | "drive" | "tray" | "torrent";
+  reason: "startup" | "watch" | "drive" | "tray" | "torrent" | "manual";
   stats: ScanStats;
+}
+
+/** One rename on disk, file or folder. */
+export interface RenameMove {
+  from: string;
+  to: string;
+  folder: boolean;
+}
+
+export interface RenamePlan {
+  media_item_id: number;
+  /** The title as the library shows it now. */
+  title: string;
+  /** "Inception (2010)", once known. */
+  target: string | null;
+  /** Files first, then their folder. Empty when already named this way. */
+  moves: RenameMove[];
+  skipped: string | null;
+  /** Files left as they are, with why (a remake filed under the same title). */
+  notes: string[];
+}
+
+export interface RenameReport {
+  renamed: number;
+  unchanged: number;
+  /** [title, reason] */
+  failed: [string, string][];
 }
 
 export interface DetectedPlayer {
@@ -363,6 +390,14 @@ export const api = {
   quitApp: () => invoke<void>("quit_app"),
   /** Show vortex.log in Explorer, for sending on when something breaks. */
   revealLog: () => invoke<void>("reveal_log"),
+  /** What renaming to TMDb names would do; nothing changes on disk. No ids = every movie. */
+  renamePreview: (ids?: number[]) => invoke<RenamePlan[]>("rename_preview", { ids: ids ?? null }),
+  renameApply: (ids: number[]) => invoke<RenameReport>("rename_apply", { ids }),
+  /** Reverses the last applied rename; resolves to the number of moves undone. */
+  renameUndo: () => invoke<number>("rename_undo"),
+  renameCanUndo: () => invoke<boolean>("rename_can_undo"),
+  onDurationsProgress: (cb: (p: DurationProgress) => void): Promise<UnlistenFn> =>
+    listen<DurationProgress>("durations-progress", (ev) => cb(ev.payload)),
   onDurationsDone: (cb: (p: DurationProgress) => void): Promise<UnlistenFn> =>
     listen<DurationProgress>("durations-done", (ev) => cb(ev.payload)),
 

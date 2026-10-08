@@ -74,6 +74,40 @@ enum Link {
     PotWindow,
 }
 
+impl Link {
+    /// VLC's HTTP port and mpv's pipe belong to the process we launched.
+    /// PotPlayer's window, and the clock used for players with no link, are
+    /// shared by whatever is playing.
+    fn per_launch(&self) -> bool {
+        matches!(self, Link::VlcHttp { .. } | Link::MpvPipe { .. })
+    }
+}
+
+/// Bumped by every playback Vortex starts. A tracker whose link is shared
+/// stops when a newer playback begins: it would otherwise read the new file's
+/// position into the old file, or keep counting the clock through it.
+static SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether the tracker should keep going. A per-launch link we have heard from
+/// ends with its own process: VLC leaves its window open when a file ends, and
+/// autoplay opens a new one, so "any vlc.exe still running" kept the old
+/// tracker alive, its final save pending, until every VLC window was closed.
+fn still_tracking(link: &Link, child_gone: bool, seen_playing: bool, my_session: u64, sys: &mut sysinfo::System, exe_name: &str) -> bool {
+    use std::sync::atomic::Ordering;
+    if !link.per_launch() && SESSION.load(Ordering::SeqCst) != my_session {
+        return false;
+    }
+    if !child_gone {
+        return true;
+    }
+    if link.per_launch() && seen_playing {
+        return false;
+    }
+    // Single-instance players hand the file to an existing window and exit at
+    // once; keep tracking while any process of that name lives.
+    player_running(sys, exe_name)
+}
+
 #[cfg(windows)]
 mod pot {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
@@ -352,6 +386,8 @@ pub fn play(app: AppHandle, episode_id: i64) -> Result<bool, String> {
 
     let started = Instant::now();
     let mut duration = episode.duration_secs;
+    let my_session = SESSION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    tracing::info!(episode_id, player = %exe_name, start, "playback started");
     std::thread::spawn(move || {
         let mut sys = sysinfo::System::new();
         let mut exact_pos: Option<i64> = None;
@@ -369,10 +405,7 @@ pub fn play(app: AppHandle, episode_id: i64) -> Result<bool, String> {
                     child_gone = true;
                 }
             }
-            // Single-instance players hand the file to an existing window and
-            // exit at once; keep tracking while any process of that name lives.
-            let alive = if child_gone { player_running(&mut sys, &exe_name) } else { true };
-            if !alive {
+            if !still_tracking(&link, child_gone, seen_playing, my_session, &mut sys, &exe_name) {
                 break;
             }
 
@@ -426,6 +459,7 @@ pub fn play(app: AppHandle, episode_id: i64) -> Result<bool, String> {
                 completed = true;
             }
         }
+        tracing::info!(episode_id, position, completed, exact, "playback ended");
 
         let state = app.state::<AppState>();
         let autoplay = db_flag(&app, "autoplay_next", true);
@@ -524,6 +558,7 @@ pub fn play_url_tracked(
 
     let exe_name = Path::new(&path).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     let started = Instant::now();
+    let my_session = SESSION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     std::thread::spawn(move || {
         let mut sys = sysinfo::System::new();
         let mut exact_pos: Option<i64> = None;
@@ -536,8 +571,7 @@ pub fn play_url_tracked(
                     child_gone = true;
                 }
             }
-            let alive = if child_gone { player_running(&mut sys, &exe_name) } else { true };
-            if !alive {
+            if !still_tracking(&link, child_gone, exact_pos.is_some(), my_session, &mut sys, &exe_name) {
                 break;
             }
             if let Reading::Playing { pos, len } = read_link(&link) {

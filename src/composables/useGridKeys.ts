@@ -1,4 +1,5 @@
-import { onMounted, onUnmounted, type Ref } from "vue";
+import type { Ref } from "vue";
+import { useEventListener } from "@vueuse/core";
 
 /**
  * Arrow-key navigation across focusable cards (`[data-card]`) laid out in a
@@ -48,6 +49,7 @@ export function useGridKeys(container: Ref<HTMLElement | undefined>) {
     }
   }
 
-  onMounted(() => container.value?.addEventListener("keydown", onKey));
-  onUnmounted(() => container.value?.removeEventListener("keydown", onKey));
+  // Follows the ref: a `v-if` that swaps the container element (opening and
+  // closing a collection) would otherwise leave the new grid without keys.
+  useEventListener(container, "keydown", onKey);
 }

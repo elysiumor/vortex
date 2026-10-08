@@ -159,7 +159,9 @@ async function startDownload() {
   if (!preview.value) return;
   if (!status.value?.protected) {
     const s = await api.getSettings();
-    if (s.torrent_unprotected_ack !== "1") { warnUnprotected.value = true; return; }
+    // A stream whose warning was cancelled earlier must not ride along on
+    // this one's "Download unprotected" and play instead of downloading.
+    if (s.torrent_unprotected_ack !== "1") { pendingStream.value = null; warnUnprotected.value = true; return; }
   }
   await reallyStart();
 }
@@ -274,10 +276,15 @@ const peak = (series: [number, number][]) => Math.max(0, ...series.map((p) => Ma
 
 let timer: number | undefined;
 let unlistenEnded: (() => void) | undefined;
+// The first status call can wait seconds on the engine starting. Leaving the
+// page meanwhile ran onUnmounted before the timer and listener existed, and
+// they then ran forever, one more set per visit.
+let alive = true;
 onMounted(async () => {
   await refreshStatus();
   await refreshList();
   await refreshDetails();
+  if (!alive) return;
   // One tick at a time. Pausing or resuming a torrent holds librqbit's state
   // lock, and torrent_list needs it, so a tick can outlast the interval. Left
   // unguarded the calls stack up and all return at once, long after the data
@@ -294,13 +301,14 @@ onMounted(async () => {
       ticking = false;
     }
   }, 2000);
-  unlistenEnded = await api.onStreamEnded((e) => {
+  const unlisten = await api.onStreamEnded((e) => {
     if (e.ephemeral) { streamTarget = e.id; streamEnded.value = e; }
     else toast(`Stopped ${e.name} at ${hms(e.position_secs)}`);
     refreshList();
   });
+  if (alive) unlistenEnded = unlisten; else unlisten();
 });
-onUnmounted(() => { clearInterval(timer); unlistenEnded?.(); });
+onUnmounted(() => { alive = false; clearInterval(timer); unlistenEnded?.(); });
 
 /** A magnet: link clicked outside the app (deep link) lands here. */
 async function streamFrom(url: string) {

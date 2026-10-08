@@ -3,6 +3,7 @@ use crate::db::{
 };
 use crate::player::{self, DetectedPlayer};
 use crate::probe;
+use crate::rename;
 use crate::backup::{self, BackupInfo};
 use crate::scanner::{self, ScanStats};
 use crate::tmdb::{self, Details, TmdbMatch};
@@ -38,27 +39,25 @@ pub async fn list_libraries(app: AppHandle) -> R<Vec<Library>> {
 #[tauri::command]
 pub fn add_library(state: State<AppState>, path: String) -> R<Library> {
     let conn = state.db.lock().map_err(err)?;
-    db::add_library(&conn, &path).map_err(err)
+    let lib = db::add_library_from_ui(&conn, &path)?;
+    tracing::info!(path = %lib.path, "library added");
+    Ok(lib)
 }
 
 #[tauri::command]
 pub fn remove_library(state: State<AppState>, id: i64) -> R<()> {
     let conn = state.db.lock().map_err(err)?;
-    db::remove_library(&conn, id).map_err(err)
+    db::remove_library(&conn, id).map_err(err)?;
+    tracing::info!(id, "library removed");
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn scan_libraries(app: AppHandle) -> R<ScanStats> {
-    // Own connection, not the shared one: holding that across a scan blocks
-    // every synchronous command, and those run on the main thread.
-    let stats = blocking(move || {
-        let mut conn = db::open(&app.state::<AppState>().db_path).map_err(err)?;
-        let stats = scanner::scan_all(&mut conn)?;
-        crate::tray::rebuild(&app);
-        Ok(stats)
-    })
-    .await?;
-    Ok(stats)
+    // Through the shared scan job: it waits for a watcher or startup scan
+    // instead of writing alongside it, and starts posters and durations for
+    // whatever this scan added.
+    blocking(move || crate::jobs::scan_now(&app)).await
 }
 
 #[tauri::command]
@@ -301,6 +300,29 @@ pub async fn apply_tmdb_match(app: AppHandle, media_item_id: i64, m: TmdbMatch) 
 #[tauri::command]
 pub async fn get_details(app: AppHandle, media_item_id: i64, refresh: bool) -> R<Option<Details>> {
     blocking(move || tmdb::get_details(&app, media_item_id, refresh)).await
+}
+
+// ---- rename to TMDb names ----
+
+/// What renaming would do, without doing it. `ids` None means every movie and series.
+#[tauri::command]
+pub async fn rename_preview(app: AppHandle, ids: Option<Vec<i64>>) -> R<Vec<rename::Plan>> {
+    blocking(move || rename::preview(&app, ids)).await
+}
+
+#[tauri::command]
+pub async fn rename_apply(app: AppHandle, ids: Vec<i64>) -> R<rename::Report> {
+    blocking(move || rename::apply(&app, ids)).await
+}
+
+#[tauri::command]
+pub async fn rename_undo(app: AppHandle) -> R<usize> {
+    blocking(move || rename::undo(&app)).await
+}
+
+#[tauri::command]
+pub async fn rename_can_undo(app: AppHandle) -> R<bool> {
+    blocking(move || Ok(rename::can_undo(&app))).await
 }
 
 #[tauri::command]

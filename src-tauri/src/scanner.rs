@@ -1,6 +1,6 @@
 use crate::db::{self, Library, NewEpisode};
 use crate::parser::{self, sort_key, Kind, Parsed};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -75,16 +75,18 @@ pub fn ignored_dirs(conn: &Connection) -> Vec<String> {
     list
 }
 
+/// Hidden folders only. The System attribute alone is not a reason to skip:
+/// tools that give a movie folder its poster as an icon set it, and those
+/// folders vanished. Real system folders are hidden too, or ignored by name.
 #[cfg(windows)]
-fn is_hidden_or_system(entry: &walkdir::DirEntry) -> bool {
+fn is_hidden(entry: &walkdir::DirEntry) -> bool {
     use std::os::windows::fs::MetadataExt;
     const HIDDEN: u32 = 0x2;
-    const SYSTEM: u32 = 0x4;
-    entry.metadata().map(|m| m.file_attributes() & (HIDDEN | SYSTEM) != 0).unwrap_or(false)
+    entry.metadata().map(|m| m.file_attributes() & HIDDEN != 0).unwrap_or(false)
 }
 
 #[cfg(not(windows))]
-fn is_hidden_or_system(entry: &walkdir::DirEntry) -> bool {
+fn is_hidden(entry: &walkdir::DirEntry) -> bool {
     entry.file_name().to_string_lossy().starts_with('.')
 }
 
@@ -97,8 +99,11 @@ pub fn scan_all(conn: &mut Connection) -> Result<ScanStats, String> {
             stats.libraries_skipped.push(lib.path.clone());
             continue;
         }
-        scan_library(conn, &lib, &ignore, &mut stats)?;
-        stats.libraries_scanned += 1;
+        if scan_library(conn, &lib, &ignore, &mut stats)? {
+            stats.libraries_scanned += 1;
+        } else {
+            stats.libraries_skipped.push(lib.path.clone());
+        }
     }
     db::prune_empty_items(conn).map_err(|e| e.to_string())?;
     Ok(stats)
@@ -133,6 +138,28 @@ struct Seen {
     size: u64,
     modified: i64,
     parsed: Parsed,
+    /// Sidecar subtitle paths joined with '|', found during the walk so the
+    /// write phase never touches the disk.
+    subtitles: Option<String>,
+}
+
+/// LIKE pattern for paths strictly inside `folder`. Ends with a separator so
+/// `F:\TV\Show` does not also match `F:\TV\Show 2`, and escapes LIKE's
+/// wildcards, since `_` is common in folder names. Use with `ESCAPE '^'`.
+fn inside_pattern(folder: &Path) -> String {
+    let mut s = folder.to_string_lossy().to_string();
+    if !s.ends_with(['\\', '/']) {
+        s.push(std::path::MAIN_SEPARATOR);
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        if matches!(c, '%' | '_' | '^') {
+            out.push('^');
+        }
+        out.push(c);
+    }
+    out.push('%');
+    out
 }
 
 fn file_name(p: &Path) -> String {
@@ -179,23 +206,22 @@ fn extra_label(owner: &Path, path: &Path) -> String {
 
 /// The series that has real episodes under `folder`, if any.
 fn series_under(conn: &Connection, folder: &Path) -> rusqlite::Result<Option<i64>> {
-    let mut stmt = conn.prepare(
-        "SELECT e.media_item_id, e.path FROM episodes e JOIN media_items m ON m.id = e.media_item_id
-         WHERE m.kind = 'series' AND e.extra IS NULL AND e.path LIKE ?1 LIMIT 50",
-    )?;
-    let like = format!("{}%", folder.to_string_lossy());
-    let rows: Vec<(i64, String)> = stmt.query_map([&like], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
-    Ok(rows.into_iter().find(|(_, p)| Path::new(p).starts_with(folder)).map(|(id, _)| id))
+    conn.query_row(
+        "SELECT e.media_item_id FROM episodes e JOIN media_items m ON m.id = e.media_item_id
+         WHERE m.kind = 'series' AND e.extra IS NULL AND e.path LIKE ?1 ESCAPE '^' LIMIT 1",
+        [inside_pattern(folder)],
+        |r| r.get(0),
+    )
+    .optional()
 }
 
 /// The one series with episodes under `folder`, or None if there are several or none.
 fn sole_series_under(conn: &Connection, folder: &Path) -> rusqlite::Result<Option<i64>> {
     let mut stmt = conn.prepare(
         "SELECT DISTINCT e.media_item_id FROM episodes e JOIN media_items m ON m.id = e.media_item_id
-         WHERE m.kind = 'series' AND e.extra IS NULL AND e.path LIKE ?1 LIMIT 2",
+         WHERE m.kind = 'series' AND e.extra IS NULL AND e.path LIKE ?1 ESCAPE '^' LIMIT 2",
     )?;
-    let like = format!("{}%", folder.to_string_lossy());
-    let ids: Vec<i64> = stmt.query_map([&like], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    let ids: Vec<i64> = stmt.query_map([inside_pattern(folder)], |r| r.get(0))?.collect::<Result<_, _>>()?;
     Ok(if ids.len() == 1 { Some(ids[0]) } else { None })
 }
 
@@ -203,41 +229,61 @@ fn sole_series_under(conn: &Connection, folder: &Path) -> rusqlite::Result<Optio
 fn movie_in(conn: &Connection, folder: &Path) -> rusqlite::Result<Option<i64>> {
     let mut stmt = conn.prepare(
         "SELECT e.media_item_id, e.path FROM episodes e JOIN media_items m ON m.id = e.media_item_id
-         WHERE m.kind = 'movie' AND e.extra IS NULL AND e.path LIKE ?1 LIMIT 50",
+         WHERE m.kind = 'movie' AND e.extra IS NULL AND e.path LIKE ?1 ESCAPE '^'",
     )?;
-    let like = format!("{}%", folder.to_string_lossy());
-    let rows: Vec<(i64, String)> = stmt.query_map([&like], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    let rows: Vec<(i64, String)> =
+        stmt.query_map([inside_pattern(folder)], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
     Ok(rows.into_iter().find(|(_, p)| Path::new(p).parent() == Some(folder)).map(|(id, _)| id))
 }
 
-fn scan_library(conn: &mut Connection, lib: &Library, ignore: &[String], stats: &mut ScanStats) -> Result<(), String> {
+/// Returns false when the library went away during the walk; nothing is
+/// written then, so a drive pulled mid-scan loses nothing.
+fn scan_library(conn: &mut Connection, lib: &Library, ignore: &[String], stats: &mut ScanStats) -> Result<bool, String> {
     let root = Path::new(&lib.path);
     let mut seen_paths: HashSet<String> = HashSet::new();
     // (size, modified) -> new episode id, for matching renamed files afterwards.
     let mut inserted: Vec<(i64, i64, i64)> = Vec::new();
 
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    let before = db::episode_fingerprints_for_library(&tx, lib.id).map_err(|e| e.to_string())?;
-
-    // Pass 1: collect files. Real episodes are written immediately; everything
-    // else waits until we know which folders hold series and movies.
+    // Pass 1: walk the disk with no transaction open. Holding one across a
+    // walk that can take minutes made the scan's first write fail whenever
+    // anything else wrote meanwhile (the player saves progress every 15 s),
+    // and the new files were never added.
     let mut episodes: Vec<Seen> = Vec::new();
     let mut others: Vec<Seen> = Vec::new();
+    // Folders and files that could not be read. Not seeing their files does
+    // not mean they are gone: treating them as removed deleted the episodes
+    // together with their watch progress and history.
+    let mut unreadable: Vec<PathBuf> = Vec::new();
+    let mut sub_cache: std::collections::HashMap<PathBuf, Vec<PathBuf>> = std::collections::HashMap::new();
+    let files_before = stats.files_seen;
     let walker = WalkDir::new(root).follow_links(false).into_iter().filter_entry(|e| {
         if e.depth() == 0 || !e.file_type().is_dir() {
             return true;
         }
         let name = e.file_name().to_string_lossy().to_lowercase();
-        !ignore.iter().any(|i| i == &name) && !is_hidden_or_system(e)
+        !ignore.iter().any(|i| i == &name) && !is_hidden(e)
     });
-    for entry in walker.filter_map(Result::ok) {
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                let at = e.path().map(Path::to_path_buf).unwrap_or_else(|| root.to_path_buf());
+                tracing::warn!(path = %at.display(), "scan could not read: {e}");
+                unreadable.push(at);
+                continue;
+            }
+        };
         let path = entry.path();
         if !entry.file_type().is_file() || !parser::is_video(path) {
             continue;
         }
         let meta = match entry.metadata() {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), "scan could not read: {e}");
+                unreadable.push(path.to_path_buf());
+                continue;
+            }
         };
         let name_lower = file_name(path).to_lowercase();
         if meta.len() < MIN_FILE_BYTES || name_lower.contains("sample") {
@@ -251,19 +297,30 @@ fn scan_library(conn: &mut Connection, lib: &Library, ignore: &[String], stats: 
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let parsed = parser::parse(path, root);
-        let seen = Seen { path: path.to_path_buf(), size: meta.len(), modified, parsed };
+        let subs = sidecar_subtitles(path, &mut sub_cache);
+        let subtitles = (!subs.is_empty()).then(|| subs.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>().join("|"));
+        let seen = Seen { path: path.to_path_buf(), size: meta.len(), modified, parsed, subtitles };
         if seen.parsed.kind == Kind::Series && seen.parsed.episode.is_some() && !seen.parsed.extra {
             episodes.push(seen);
         } else {
             others.push(seen);
         }
     }
+    // The drive went away during the walk: keep everything as it was.
+    if !root.is_dir() {
+        tracing::warn!(library = %lib.path, "library went offline during the scan; nothing changed");
+        stats.files_seen = files_before;
+        return Ok(false);
+    }
 
-    let mut sub_cache: std::collections::HashMap<PathBuf, Vec<PathBuf>> = std::collections::HashMap::new();
+    // Pass 2: the writes, under a write lock taken up front so they wait their turn
+    // (busy timeout) instead of failing on another connection's commit.
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+    let before = db::episode_fingerprints_for_library(&tx, lib.id).map_err(|e| e.to_string())?;
+
     let mut write = |tx: &Connection, s: &Seen, kind: &str, title: &str, year: Option<i32>, item_id: Option<i64>,
                      season: Option<i32>, episode: Option<i32>, extra: Option<&str>| -> Result<(), String> {
-        let subs = sidecar_subtitles(&s.path, &mut sub_cache);
-        let subs_str = (!subs.is_empty()).then(|| subs.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>().join("|"));
+        let subs_str = s.subtitles.clone();
         let item_id = match item_id {
             Some(id) => id,
             None => {
@@ -314,7 +371,7 @@ fn scan_library(conn: &mut Connection, lib: &Library, ignore: &[String], stats: 
         write(&tx, s, "series", &p.title, p.year, None, p.season, p.episode, None)?;
     }
 
-    // Pass 2: plain movies first (so featurettes can find them), then the rest.
+    // Plain movies first (so featurettes can find them), then the rest.
     others.sort_by_key(|s| s.parsed.extra || s.parsed.kind == Kind::Series);
     for s in &others {
         let p = &s.parsed;
@@ -386,6 +443,9 @@ fn scan_library(conn: &mut Connection, lib: &Library, ignore: &[String], stats: 
         if seen_paths.contains(&old_path) {
             continue;
         }
+        if unreadable.iter().any(|d| Path::new(&old_path).starts_with(d)) {
+            continue; // not seen because it could not be read, not because it is gone
+        }
         if let Some(idx) = inserted.iter().position(|(_, s, m)| *s == size && *m == modified) {
             let (new_id, _, _) = inserted.remove(idx);
             db::move_progress(&tx, old_id, new_id).map_err(|e| e.to_string())?;
@@ -402,7 +462,8 @@ fn scan_library(conn: &mut Connection, lib: &Library, ignore: &[String], stats: 
     }
     db::delete_episodes(&tx, &gone).map_err(|e| e.to_string())?;
 
-    tx.commit().map_err(|e| e.to_string())
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 #[cfg(test)]

@@ -259,6 +259,40 @@ pub fn add_library(conn: &Connection, path: &str) -> rusqlite::Result<Library> {
     Ok(Library { id, path: path.to_string(), name, available: Path::new(path).is_dir() })
 }
 
+/// Folder comparison key: case-insensitive, one separator style, no trailing separator.
+fn folder_key(p: &str) -> String {
+    p.replace('/', "\\").trim_end_matches('\\').to_lowercase()
+}
+
+/// Add a library from the UI. Libraries may not overlap: a file under two of
+/// them belonged to whichever was scanned last, so ownership flipped on every
+/// scan, and removing either one deleted the other's watch progress with it.
+/// A folder inside an existing library is refused; libraries inside the new
+/// folder are folded into it with their progress intact.
+pub fn add_library_from_ui(conn: &Connection, path: &str) -> Result<Library, String> {
+    let key = folder_key(path);
+    for mut lib in list_libraries_rows(conn).map_err(|e| e.to_string())? {
+        let other = folder_key(&lib.path);
+        if other == key {
+            lib.available = Path::new(&lib.path).is_dir();
+            return Ok(lib);
+        }
+        if key.starts_with(&format!("{other}\\")) {
+            return Err(format!("{path} is already part of the library {}", lib.path));
+        }
+    }
+    let new = add_library(conn, path).map_err(|e| e.to_string())?;
+    for lib in list_libraries_rows(conn).map_err(|e| e.to_string())? {
+        if lib.id != new.id && folder_key(&lib.path).starts_with(&format!("{key}\\")) {
+            conn.execute("UPDATE episodes SET library_id = ?1 WHERE library_id = ?2", [new.id, lib.id])
+                .map_err(|e| e.to_string())?;
+            conn.execute("DELETE FROM libraries WHERE id = ?1", [lib.id]).map_err(|e| e.to_string())?;
+            tracing::info!(inner = %lib.path, outer = %path, "library folded into the new one");
+        }
+    }
+    Ok(new)
+}
+
 pub fn remove_library(conn: &Connection, id: i64) -> rusqlite::Result<()> {
     conn.execute("DELETE FROM libraries WHERE id = ?1", [id])?;
     prune_empty_items(conn)
@@ -992,11 +1026,18 @@ pub fn set_item_category(conn: &Connection, media_item_id: i64, category: Option
     Ok(())
 }
 
+/// `include_checked` ("Retry unmatched") also retries titles that were
+/// searched before and found nothing. It never re-searches a title that
+/// already has a match: a TMDB entry with no poster, picked by hand with Fix
+/// match, would otherwise be replaced by the top search result.
 pub fn items_missing_poster(conn: &Connection, include_checked: bool) -> rusqlite::Result<Vec<MediaItem>> {
     Ok(list_media(conn, None)?
         .into_iter()
         .filter(|m| m.poster_path.is_none())
-        .filter(|m| include_checked || !poster_checked(conn, m.id).unwrap_or(false))
+        .filter(|m| {
+            let checked = poster_checked(conn, m.id).unwrap_or(false);
+            !checked || (include_checked && m.tmdb_id.is_none())
+        })
         .collect())
 }
 
@@ -1007,6 +1048,11 @@ fn poster_checked(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
 
 pub fn mark_poster_checked(conn: &Connection, id: i64) -> rusqlite::Result<()> {
     conn.execute("UPDATE media_items SET poster_checked = 1 WHERE id = ?1", [id])?;
+    Ok(())
+}
+
+pub fn clear_poster_checked(conn: &Connection, id: i64) -> rusqlite::Result<()> {
+    conn.execute("UPDATE media_items SET poster_checked = 0 WHERE id = ?1", [id])?;
     Ok(())
 }
 
@@ -1072,33 +1118,39 @@ pub fn next_episode(conn: &Connection, episode_id: i64) -> rusqlite::Result<Opti
 /// Items the user is part-way through, plus the "next up" episode for series
 /// where the last watched episode was completed.
 pub fn continue_watching(conn: &Connection, limit: i64) -> rusqlite::Result<Vec<ContinueItem>> {
-    // Most recently touched episode per media item.
+    // Most recently touched episode per media item, one row per item even on
+    // ties: "Mark watched" stamps a whole series with the same time, and those
+    // rows used to fill the LIMIT before duplicates were dropped, emptying
+    // Home. Rows that can never be shown (dismissed with X, finished films,
+    // fully watched series) are filtered here too, and the limit is applied
+    // to what is kept rather than to what is read.
     let sql = format!(
         r#"{EPISODE_SELECT}
-        WHERE w.last_watched = (
-            SELECT MAX(w2.last_watched) FROM watch_progress w2
-            JOIN episodes e2 ON e2.id = w2.episode_id
-            WHERE e2.media_item_id = e.media_item_id
+        JOIN media_items m ON m.id = e.media_item_id
+        WHERE e.id IN (
+            SELECT episode_id FROM (
+                SELECT w2.episode_id, ROW_NUMBER() OVER (
+                    PARTITION BY e2.media_item_id
+                    ORDER BY w2.last_watched DESC, e2.season DESC, e2.episode DESC
+                ) AS rn
+                FROM watch_progress w2 JOIN episodes e2 ON e2.id = w2.episode_id
+            ) WHERE rn = 1
         )
-        ORDER BY w.last_watched DESC, e.season DESC, e.episode DESC LIMIT ?1"#
+        AND COALESCE(w.hidden, 0) = 0
+        AND (COALESCE(w.completed, 0) = 0 OR (m.kind = 'series' AND e.extra IS NULL AND EXISTS (
+            SELECT 1 FROM episodes e3 LEFT JOIN watch_progress w3 ON w3.episode_id = e3.id
+            WHERE e3.media_item_id = e.media_item_id AND e3.extra IS NULL AND COALESCE(w3.completed, 0) = 0
+        )))
+        ORDER BY w.last_watched DESC, e.season DESC, e.episode DESC"#
     );
     let mut stmt = conn.prepare(&sql)?;
-    let recent: Vec<Episode> = stmt.query_map([limit], episode_from_row)?.collect::<Result<_, _>>()?;
-
-    // Episodes dismissed from the Home page with the X button.
-    let mut hidden_stmt = conn.prepare("SELECT episode_id FROM watch_progress WHERE hidden = 1")?;
-    let hidden: std::collections::HashSet<i64> =
-        hidden_stmt.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
-    drop(hidden_stmt);
+    let mut rows = stmt.query([])?;
     let mut out = Vec::new();
-    let mut seen_items = std::collections::HashSet::new();
-    for ep in recent {
-        if !seen_items.insert(ep.media_item_id) {
-            continue; // ties on last_watched: keep only the first per item
+    while let Some(row) = rows.next()? {
+        if out.len() as i64 >= limit {
+            break;
         }
-        if hidden.contains(&ep.id) {
-            continue;
-        }
+        let ep = episode_from_row(row)?;
         let (title, kind, year, poster_path, tmdb_id): (String, String, Option<i32>, Option<String>, Option<i64>) =
             conn.query_row(
                 "SELECT title, kind, year, poster_path, tmdb_id FROM media_items WHERE id = ?1",
@@ -1109,13 +1161,7 @@ pub fn continue_watching(conn: &Connection, limit: i64) -> rusqlite::Result<Vec<
             out.push(ContinueItem { episode: ep, title, kind, year, poster_path, tmdb_id });
             continue;
         }
-        if kind == "movie" {
-            continue;
-        }
-        // Completed: find the next unwatched episode after it in the series.
-        if ep.extra.is_some() {
-            continue;
-        }
+        // Completed series episode: find the next unwatched episode after it.
         let all: Vec<Episode> = list_episodes(conn, ep.media_item_id)?.into_iter().filter(|x| x.extra.is_none()).collect();
         let pos = all.iter().position(|x| x.id == ep.id).unwrap_or(0);
         if let Some(next) = all.iter().skip(pos + 1).find(|x| !x.completed) {
@@ -1252,6 +1298,73 @@ mod tests {
         // Every session is still on record for the statistics.
         let sessions: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |r| r.get(0)).unwrap();
         assert_eq!(sessions, 3);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn nested_libraries_are_refused_or_folded_in() {
+        let (conn, path) = temp_db();
+        let inner = add_library(&conn, r"F:\Media\Anime").unwrap();
+        conn.execute("INSERT INTO media_items (id, kind, title, sort_key) VALUES (1, 'movie', 'Akira', 'akira')", []).unwrap();
+        conn.execute(
+            "INSERT INTO episodes (id, media_item_id, library_id, path, file_name, size, modified)
+             VALUES (1, 1, ?1, ?2, 'akira.mkv', 1, 1)",
+            params![inner.id, r"F:\Media\Anime\akira.mkv"],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO watch_progress (episode_id, position_secs, completed, last_watched) VALUES (1, 900, 0, datetime('now'))", []).unwrap();
+
+        assert!(add_library_from_ui(&conn, r"f:\media\anime\Movies").is_err(), "a folder inside a library is refused");
+        assert_eq!(add_library_from_ui(&conn, r"F:\media\anime\").unwrap().id, inner.id, "the same folder is the same library");
+
+        let outer = add_library_from_ui(&conn, r"F:\Media").unwrap();
+        let libs = list_libraries_rows(&conn).unwrap();
+        assert_eq!(libs.len(), 1, "the inner library folds into the outer one");
+        let (lib_id, pos): (i64, i64) = conn
+            .query_row("SELECT e.library_id, w.position_secs FROM episodes e JOIN watch_progress w ON w.episode_id = e.id", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((lib_id, pos), (outer.id, 900), "files move over with their progress");
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// "Mark watched" gives every episode of a series the same timestamp. Those
+    /// ties used to fill the whole limit with one title, which then had no next
+    /// episode, so Home showed nothing at all.
+    #[test]
+    fn continue_watching_survives_a_series_marked_watched() {
+        let (conn, path) = temp_db();
+        let lib = add_library(&conn, r"F:\Test").unwrap();
+        conn.execute("INSERT INTO media_items (id, kind, title, sort_key) VALUES (1, 'series', 'Done', 'done')", []).unwrap();
+        conn.execute("INSERT INTO media_items (id, kind, title, sort_key) VALUES (2, 'movie', 'Halfway', 'halfway')", []).unwrap();
+        for ep in 1..=6i64 {
+            conn.execute(
+                "INSERT INTO episodes (id, media_item_id, library_id, path, file_name, season, episode, size, modified)
+                 VALUES (?1, 1, ?2, ?3, 'e.mkv', 1, ?1, 1, 1)",
+                params![ep, lib.id, format!(r"F:\Test\done{ep}.mkv")],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO episodes (id, media_item_id, library_id, path, file_name, size, modified)
+             VALUES (100, 2, ?1, ?2, 'movie.mkv', 1, 1)",
+            params![lib.id, r"F:\Test\movie.mkv"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO watch_progress (episode_id, position_secs, completed, last_watched)
+             VALUES (100, 600, 0, datetime('now', '-1 day'))",
+            [],
+        )
+        .unwrap();
+        set_item_watched(&conn, 1, true).unwrap();
+
+        let cont = continue_watching(&conn, 3).unwrap();
+        let titles: Vec<&str> = cont.iter().map(|c| c.title.as_str()).collect();
+        assert_eq!(titles, vec!["Halfway"], "the finished series must not crowd out the film in progress");
 
         drop(conn);
         let _ = std::fs::remove_file(&path);

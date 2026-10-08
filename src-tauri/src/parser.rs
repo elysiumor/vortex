@@ -53,9 +53,21 @@ static SEASON_CODE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)(?:^|[ ._\-\[(])S(\d{1,2})(?:$|[ ._\-\])+])").unwrap());
 static YEAR: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?:^|[ ._\-\[(])((?:19|20)\d{2})(?:$|[ ._\-\])])").unwrap());
+/// Release tags. Several are ordinary words too ("web", "season", "dual",
+/// "internal", "complete"), so a title is cut at the first tag that has some
+/// title before it, never at one that starts it.
 static JUNK: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)\b(2160p|1080p|1080i|720p|480p|4k|uhd|hdr|hdr10|dv|x264|x265|h\.?264|h\.?265|hevc|avc|xvid|divx|10bit|8bit|bluray|blu-ray|bdrip|brrip|webrip|web-dl|webdl|web|hdrip|dvdrip|dvd|hdtv|pdtv|cam|ts|tc|hdcam|remux|aac|ac3|eac3|dts|dd5\.?1|ddp5\.?1|5\.1|7\.1|atmos|truehd|yify|yts|rarbg|eztv|ettv|proper|repack|rerip|extended|unrated|remastered|directors\.?cut|internal|limited|multi|dual|dubbed|subbed|amzn|nf|dsnp|hmax|atvp|complete|season|s\d{1,2})\b.*$",
+        r"(?i)\b(2160p|1080p|1080i|720p|480p|4k|uhd|hdr|hdr10|dv|x264|x265|h\.?264|h\.?265|hevc|avc|xvid|divx|10bit|8bit|bluray|blu-ray|bdrip|brrip|webrip|web-dl|webdl|web|hdrip|dvdrip|dvd|hdtv|pdtv|cam|ts|tc|hdcam|remux|aac|ac3|eac3|dts|dd5\.?1|ddp5\.?1|5\.1|7\.1|atmos|truehd|yify|yts|rarbg|eztv|ettv|proper|repack|rerip|extended|unrated|remastered|directors\.?cut|internal|limited|multi|dual|dubbed|subbed|amzn|nf|dsnp|hmax|atvp|complete|season|s\d{1,2})\b",
+    )
+    .unwrap()
+});
+/// The subset of tags that never occur in a real title. Used on text that
+/// ends where a year was found, which is all meant to be title: "Charlotte's
+/// Web (2006)" must keep "Web", "A Complete Unknown (2024)" its "Complete".
+static TECH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\b(2160p|1080p|1080i|720p|480p|4k|hdr10|x264|x265|h\.?264|h\.?265|hevc|xvid|divx|10bit|8bit|bluray|blu-ray|bdrip|brrip|webrip|web-dl|webdl|hdrip|dvdrip|hdtv|pdtv|hdcam|remux|aac|ac3|eac3|dd5\.?1|ddp5\.?1|truehd|yify|yts|rarbg|eztv|ettv|amzn|dsnp|hmax|atvp)\b",
     )
     .unwrap()
 });
@@ -68,9 +80,15 @@ pub const VIDEO_EXTENSIONS: &[&str] = &[
 
 /// Folder names that hold bonus material rather than episodes or the film itself.
 const EXTRAS_DIRS: &[&str] = &[
-    "extras", "extra", "featurettes", "featurette", "bonus", "bonus features", "special features", "specials",
-    "behind the scenes", "deleted scenes", "trailers", "trailer", "interviews", "bloopers", "making of",
-    "shorts", "other", "others", "scenes", "promos", "teasers", "webisodes", "outtakes", "gag reel",
+    "featurettes", "featurette", "bonus features", "special features", "behind the scenes", "deleted scenes",
+    "bloopers", "making of", "outtakes", "gag reel",
+];
+/// Also bonus folders inside a title's folder, but plain enough to be a
+/// category of their own directly under the library root ("Specials",
+/// "Shorts", "Other"), where there is no title for them to belong to.
+const GENERIC_EXTRAS_DIRS: &[&str] = &[
+    "extras", "extra", "bonus", "specials", "trailers", "trailer", "interviews", "shorts", "other", "others",
+    "scenes", "promos", "teasers", "webisodes",
 ];
 
 pub fn is_video(path: &Path) -> bool {
@@ -81,6 +99,11 @@ pub fn is_video(path: &Path) -> bool {
 }
 
 pub fn is_extras_dir(name: &str) -> bool {
+    let n = name.trim().to_lowercase().replace(['_', '.'], " ");
+    EXTRAS_DIRS.contains(&n.as_str()) || GENERIC_EXTRAS_DIRS.contains(&n.as_str())
+}
+
+fn is_specific_extras_dir(name: &str) -> bool {
     let n = name.trim().to_lowercase().replace(['_', '.'], " ");
     EXTRAS_DIRS.contains(&n.as_str())
 }
@@ -101,10 +124,27 @@ pub fn is_season_dir(name: &str) -> bool {
 /// Normalise a raw title fragment: strip release-group brackets, replace
 /// separators with spaces, drop quality tags, trim punctuation.
 pub fn clean_title(raw: &str) -> String {
+    clean_with(raw, &JUNK)
+}
+
+/// For text that ends where a year was found: cut only unambiguous tags.
+fn clean_title_before_year(raw: &str) -> String {
+    clean_with(raw, &TECH)
+}
+
+fn clean_with(raw: &str, tags: &Regex) -> String {
     let s = BRACKET_GROUP.replace(raw, "");
     let s = s.replace(['.', '_'], " ");
-    let s = JUNK.replace(&s, "");
-    let s = MULTI_SPACE.replace_all(&s, " ");
+    let s = s.trim_start();
+    // A tag at the very start is the title itself ("Season of the Witch",
+    // "Dual", "Internal Affairs"); cutting there emptied the title and filed
+    // the film under its folder's name, merging unrelated films into one.
+    let cut = tags
+        .find_iter(s)
+        .map(|m| m.start())
+        .find(|&i| s[..i].chars().any(|c| c.is_alphanumeric()))
+        .unwrap_or(s.len());
+    let s = MULTI_SPACE.replace_all(&s[..cut], " ");
     s.trim_matches(|c: char| c.is_whitespace() || "-–—([+".contains(c)).to_string()
 }
 
@@ -115,6 +155,32 @@ pub fn sort_key(title: &str) -> String {
         .filter(|c| c.is_alphanumeric())
         .flat_map(|c| c.to_lowercase())
         .collect()
+}
+
+/// Season, episode and (for "S01E01-E02") the last episode, when a file name
+/// spells them out. None for names that only number episodes ("Show - 27").
+pub fn episode_code(stem: &str) -> Option<(i32, i32, Option<i32>)> {
+    if let Some(c) = SEASON_EP.captures(stem) {
+        let season = parse_i32(&c[1])?;
+        let first = parse_i32(&c[2])?;
+        // Every number after the first E: "S01E01E02", "S01E01-E03".
+        let whole = c.get(0)?.as_str();
+        let after = &whole[c.get(2)?.end() - c.get(0)?.start()..];
+        static NUM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d{1,3}").unwrap());
+        let last = NUM.find_iter(after).filter_map(|m| parse_i32(m.as_str())).max().filter(|l| *l > first);
+        return Some((season, first, last));
+    }
+    for re in [&*X_EP, &*LONG_EP] {
+        if let Some(c) = re.captures(stem) {
+            return Some((parse_i32(&c[1])?, parse_i32(&c[2])?, None));
+        }
+    }
+    None
+}
+
+/// The release year a file or folder name carries, if any.
+pub fn year_in(name: &str) -> Option<i32> {
+    find_year(name).map(|(y, _)| y)
 }
 
 fn find_year(s: &str) -> Option<(i32, usize)> {
@@ -137,11 +203,10 @@ fn parse_i32(s: &str) -> Option<i32> {
 
 /// (title, year) from a folder name such as "Euphoria (2019) Season 1 S01 + Extras (1080p ...)".
 fn folder_title(name: &str) -> (String, Option<i32>) {
-    let (year, cut) = match find_year(name) {
-        Some((y, pos)) => (Some(y), pos),
-        None => (None, name.len()),
-    };
-    (clean_title(&name[..cut]), year)
+    match find_year(name) {
+        Some((y, pos)) => (clean_title_before_year(&name[..pos]), Some(y)),
+        None => (clean_title(name), None),
+    }
 }
 
 /// Public wrapper so the scanner can name a series after its folder.
@@ -157,14 +222,20 @@ fn agrees(a: &str, b: &str) -> bool {
 }
 
 /// True when any folder between the file and the library root is extras-like.
+/// Generic names ("Specials", "Other") count only inside a title's folder;
+/// directly under the root they are a category, and treating them as bonus
+/// material hid every film in them.
 pub fn in_extras_dir(path: &Path, library_root: &Path) -> bool {
     let mut cur = path.parent();
     while let Some(p) = cur {
         if p == library_root || !p.starts_with(library_root) {
             return false;
         }
-        if p.file_name().map(|n| is_extras_dir(&n.to_string_lossy())).unwrap_or(false) {
-            return true;
+        if let Some(name) = p.file_name().map(|n| n.to_string_lossy()) {
+            let top_level = p.parent() == Some(library_root);
+            if is_specific_extras_dir(&name) || (!top_level && is_extras_dir(&name)) {
+                return true;
+            }
         }
         cur = p.parent();
     }
@@ -235,11 +306,10 @@ fn parse_inner(path: &Path, library_root: &Path) -> Parsed {
     }
 
     // 3. Movie.
-    let (year, cut) = match find_year(&stem) {
-        Some((y, pos)) => (Some(y), pos),
-        None => (None, stem.len()),
+    let (year, mut title) = match find_year(&stem) {
+        Some((y, pos)) => (Some(y), clean_title_before_year(&stem[..pos])),
+        None => (None, clean_title(&stem)),
     };
-    let mut title = clean_title(&stem[..cut]);
     if title.is_empty() {
         // Filename was just a year or junk; fall back to the folder name.
         if let Some(folder) = parent_name.as_deref() {
@@ -396,5 +466,44 @@ mod tests {
     #[test]
     fn sort_key_groups_variants() {
         assert_eq!(sort_key("Breaking Bad"), sort_key("breaking.bad"));
+    }
+
+    /// Titles made of words that are also release tags used to come out
+    /// empty, fall back to the folder name, and merge into one "Movies" item.
+    #[test]
+    fn titles_that_look_like_release_tags_survive() {
+        for (rel, title, year) in [
+            ("Movies/Internal Affairs (1990).mkv", "Internal Affairs", 1990),
+            ("Movies/Dual (2022).mkv", "Dual", 2022),
+            ("Movies/Season of the Witch (2011).mkv", "Season of the Witch", 2011),
+            ("Movies/Charlotte's Web (2006).mkv", "Charlotte's Web", 2006),
+            ("Movies/A Complete Unknown (2024) 1080p WEB-DL.mkv", "A Complete Unknown", 2024),
+            ("Movies/Cam.2018.1080p.NF.WEB-DL.mkv", "Cam", 2018),
+        ] {
+            let r = p(rel);
+            assert_eq!((r.title.as_str(), r.year), (title, Some(year)), "{rel}");
+        }
+        // Tags after the title are still cut when there is no year to cut at.
+        assert_eq!(p("Movies/Some.Film.1080p.WEB-DL.x264.mkv").title, "Some Film");
+    }
+
+    #[test]
+    fn episode_codes_and_ranges() {
+        assert_eq!(episode_code("Show.S01E05.1080p.WEB"), Some((1, 5, None)));
+        assert_eq!(episode_code("Show S02E01-E02 720p"), Some((2, 1, Some(2))));
+        assert_eq!(episode_code("Show.S02E01E02E03"), Some((2, 1, Some(3))));
+        assert_eq!(episode_code("Show 3x07"), Some((3, 7, None)));
+        assert_eq!(episode_code("[SubsPlease] Show - 27 (1080p) [ABCD1234]"), None, "anime numbering names no season");
+    }
+
+    #[test]
+    fn generic_extras_names_are_categories_at_the_top() {
+        let root = PathBuf::from("D:/Media");
+        let special = root.join("Specials/Dave Chappelle The Bird Revelation (2017).mkv");
+        assert!(!parse(&special, &root).extra, "a top-level Specials folder is a category");
+        let inside = root.join("Dark/Specials/Making Dark.mkv");
+        assert!(parse(&inside, &root).extra, "inside a title's folder it is bonus material");
+        let featurette = root.join("Featurettes/Clip.mkv");
+        assert!(parse(&featurette, &root).extra, "specific names count at any depth");
     }
 }

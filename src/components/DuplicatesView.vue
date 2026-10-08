@@ -24,10 +24,19 @@ function label(g: DuplicateGroup) {
 }
 const quality = (f: Episode) => /\b(2160p|1080p|720p|480p)\b/i.exec(f.file_name)?.[1] ?? "—";
 async function reveal(f: Episode) { try { await api.revealPath(f.path); } catch (e) { toast.error(String(e)); } }
+// The dialog clears `pending` as it closes, which can happen before the
+// button's own handler runs; hold the target where closing cannot touch it.
+let trashTarget: Episode | null = null;
+function askTrash(group: DuplicateGroup, file: Episode) {
+  trashTarget = file;
+  pending.value = { group, file };
+}
 async function confirmTrash() {
-  if (!pending.value) return;
-  try { await api.trashEpisode(pending.value.file.id); toast.success("Moved to Recycle Bin"); } catch (e) { toast.error(String(e)); }
+  const f = trashTarget;
+  trashTarget = null;
   pending.value = null;
+  if (!f) return;
+  try { await api.trashEpisode(f.id); toast.success("Moved to Recycle Bin"); } catch (e) { toast.error(String(e)); }
   await load();
 }
 onMounted(load);
@@ -54,7 +63,7 @@ defineExpose({ reload: load });
           </div>
           <div class="flex gap-1">
             <Button size="sm" variant="outline" :disabled="!f.available" @click="reveal(f)"><FolderOpen /> Explorer</Button>
-            <Button size="sm" variant="outline" class="text-destructive" :disabled="!f.available" @click="pending = { group: g, file: f }"><Trash2 /> Delete</Button>
+            <Button size="sm" variant="outline" class="text-destructive" :disabled="!f.available" @click="askTrash(g, f)"><Trash2 /> Delete</Button>
           </div>
         </div>
       </div>

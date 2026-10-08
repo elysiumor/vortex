@@ -1,12 +1,12 @@
 //! Watches library folders and rescans when files are added, removed or
 //! renamed. Also notices when an external drive comes back and rescans it.
 
-use crate::{db, jobs, AppState};
+use crate::{db, jobs, scanner, AppState};
 use notify::RecursiveMode;
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult};
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Manager};
 
@@ -15,11 +15,16 @@ pub fn start(app: AppHandle) {
 }
 
 fn run(app: AppHandle) {
-    let (tx, rx) = mpsc::channel::<()>();
+    // Carries the first relevant path of each burst, for the log.
+    let (tx, rx) = mpsc::channel::<std::path::PathBuf>();
+    // Folder names the scanner skips; refreshed every pass of the loop below.
+    let ignore: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(scanner::DEFAULT_IGNORED_DIRS.iter().map(|s| s.to_string()).collect()));
+    let ignore_events = ignore.clone();
     let mut debouncer = match new_debouncer(Duration::from_secs(3), move |res: DebounceEventResult| {
         if let Ok(events) = res {
-            if events.iter().any(|e| is_video_or_dir(&e.path)) {
-                let _ = tx.send(());
+            let ignore = ignore_events.lock().map(|g| g.clone()).unwrap_or_default();
+            if let Some(e) = events.iter().find(|e| is_relevant(&e.path, &ignore)) {
+                let _ = tx.send(e.path.clone());
             }
         }
     }) {
@@ -28,6 +33,10 @@ fn run(app: AppHandle) {
     };
 
     let mut watched: HashSet<String> = HashSet::new();
+    // Libraries seen offline at some point. Only one of these coming back
+    // needs a scan of its own; one watched for the first time was just
+    // scanned by whatever added it (startup or Settings).
+    let mut offline: HashSet<String> = HashSet::new();
     loop {
         // Add watches for libraries that are available and not watched yet
         // (covers newly added folders and a reconnected external drive).
@@ -35,7 +44,12 @@ fn run(app: AppHandle) {
             let state = app.state::<AppState>();
             let guard = state.db.lock();
             match guard {
-                Ok(conn) => db::list_libraries_rows(&conn).unwrap_or_default(),
+                Ok(conn) => {
+                    if let Ok(mut i) = ignore.lock() {
+                        *i = scanner::ignored_dirs(&conn);
+                    }
+                    db::list_libraries_rows(&conn).unwrap_or_default()
+                }
                 Err(_) => Vec::new(),
             }
         };
@@ -48,18 +62,26 @@ fn run(app: AppHandle) {
         for lib in &libs {
             if lib.available && !watched.contains(&lib.path) {
                 if debouncer.watcher().watch(Path::new(&lib.path), RecursiveMode::Recursive).is_ok() {
-                    if !watched.is_empty() || !watched.contains(&lib.path) {
+                    // The old test here was always true, so every launch and
+                    // every added folder ran a second, redundant full scan.
+                    if offline.remove(&lib.path) {
+                        tracing::info!(library = %lib.path, "library back online");
                         newly_available = true;
                     }
                     watched.insert(lib.path.clone());
                 }
-            } else if !lib.available && watched.contains(&lib.path) {
-                let _ = debouncer.watcher().unwatch(Path::new(&lib.path));
-                watched.remove(&lib.path);
+            } else if !lib.available {
+                if offline.insert(lib.path.clone()) {
+                    tracing::info!(library = %lib.path, "library offline");
+                }
+                if watched.remove(&lib.path) {
+                    let _ = debouncer.watcher().unwatch(Path::new(&lib.path));
+                }
             }
         }
         // Drop watches for removed libraries.
         let current: HashSet<String> = libs.iter().map(|l| l.path.clone()).collect();
+        offline.retain(|p| current.contains(p));
         for gone in watched.difference(&current).cloned().collect::<Vec<_>>() {
             let _ = debouncer.watcher().unwatch(Path::new(&gone));
             watched.remove(&gone);
@@ -70,8 +92,12 @@ fn run(app: AppHandle) {
 
         // Wait for file events (or time out to re-check drives).
         match rx.recv_timeout(Duration::from_secs(20)) {
-            Ok(()) => {
-                while rx.try_recv().is_ok() {} // collapse a burst into one scan
+            Ok(path) => {
+                let mut more = 0;
+                while rx.try_recv().is_ok() {
+                    more += 1; // collapse a burst into one scan
+                }
+                tracing::info!(path = %path.display(), more, "folder change");
                 if jobs::setting_on(&app, "watch_folders", true) {
                     jobs::refresh(&app, "watch");
                 }
@@ -82,10 +108,20 @@ fn run(app: AppHandle) {
     }
 }
 
-fn is_video_or_dir(p: &Path) -> bool {
-    // Torrent pieces land in `.incomplete`; a scan per piece would be wasteful.
-    if p.components().any(|c| c.as_os_str() == crate::torrent::STAGING_DIR) {
+fn is_relevant(p: &Path, ignore: &[String]) -> bool {
+    // Torrent pieces land in `.incomplete`, and folders the scanner skips
+    // (caches, AppData on a whole-drive library) churn constantly; a scan per
+    // write would be wasteful.
+    let skipped = p.components().any(|c| {
+        let name = c.as_os_str().to_string_lossy().to_lowercase();
+        name == crate::torrent::STAGING_DIR || ignore.contains(&name)
+    });
+    if skipped {
         return false;
     }
-    p.extension().is_none() || crate::parser::is_video(p)
+    // Ask the filesystem rather than guess from an "extension": release
+    // folders are full of dots ("The.Bear.S03.1080p.WEB.h264-GRP"), and a
+    // folder moved in arrives as a single event for the folder itself. A path
+    // that is gone may have been either, so let the scan decide.
+    crate::parser::is_video(p) || p.is_dir() || !p.exists()
 }

@@ -3,10 +3,11 @@ import { computed, onMounted, ref, watch } from "vue";
 import { toast } from "vue-sonner";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
-  ArrowLeft, Play, Check, RotateCcw, Timer, Info, FolderOpen, ExternalLink, Clapperboard, RefreshCw, Search, Star, Subtitles, X, Tag as TagIcon, Layers, Plus,
+  ArrowLeft, Play, Check, RotateCcw, Timer, Info, FolderOpen, ExternalLink, Clapperboard, RefreshCw, Search, Star, Subtitles, X, Tag as TagIcon, Layers, Plus, FilePen,
 } from "@lucide/vue";
 import { api, backdropSrc, posterSrc, subtitleCount, type Details, type Episode, type MediaItem, type Tag, type TmdbMatch } from "../lib/api";
 import { copyText, dateFromUnix, episodeCode, episodeTitle, fileSize, fileSizeExact, folderOf, hms, parseHms, relativeTime } from "../lib/format";
+import RenameDialog from "./RenameDialog.vue";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
@@ -161,6 +162,7 @@ async function saveCategory() { await api.setItemCategory(props.id, categoryValu
 
 // ---- TMDB match ----
 const matchOpen = ref(false);
+const renameOpen = ref(false);
 const matchQuery = ref("");
 const matchResults = ref<TmdbMatch[]>([]);
 const matchBusy = ref(false);
@@ -201,6 +203,7 @@ defineExpose({ reload: load });
           <Badge v-else variant="outline" class="cursor-pointer" @click="startCategoryEdit">{{ item.category || "No category" }}</Badge>
           <Button variant="secondary" size="sm" @click="openMatch"><Search /> Fix match</Button>
           <Button v-if="item.tmdb_id" variant="secondary" size="sm" :disabled="detailsBusy" @click="loadDetails(true)"><RefreshCw :class="{ 'animate-spin': detailsBusy }" /> Refresh</Button>
+          <Button v-if="item.tmdb_id" variant="secondary" size="sm" @click="renameOpen = true"><FilePen /> Rename files</Button>
           <Button variant="secondary" size="sm" @click="markAll(!allDone)"><component :is="allDone ? RotateCcw : Check" /> {{ allDone ? "Mark all unwatched" : "Mark all watched" }}</Button>
         </div>
 
@@ -380,6 +383,8 @@ defineExpose({ reload: load });
       <Separator />
       <p class="text-xs text-muted-foreground" v-if="details">Data from TMDB · fetched {{ details.fetched_at.slice(0, 10) }}</p>
     </div>
+
+    <RenameDialog v-model:open="renameOpen" :ids="[props.id]" @done="load" />
 
     <!-- Fix match -->
     <Dialog v-model:open="matchOpen">

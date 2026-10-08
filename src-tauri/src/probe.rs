@@ -6,7 +6,6 @@ use crate::AppState;
 use serde::Serialize;
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, Manager};
 
 const FFPROBE_CANDIDATES: &[&str] = &[
@@ -24,8 +23,22 @@ pub fn detect_ffprobe_cached() -> Option<String> {
     DETECTED.get_or_init(detect_ffprobe).clone()
 }
 
+/// A command that never opens a console window. The release build is a GUI
+/// app, so Windows gives every console child (ffprobe, `where`) a window of
+/// its own unless told not to, and a scan flashed one per probed file.
+fn hidden(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 pub fn detect_ffprobe() -> Option<String> {
-    if let Ok(out) = Command::new("where").arg("ffprobe").output() {
+    if let Ok(out) = hidden("where").arg("ffprobe").output() {
         if out.status.success() {
             if let Some(line) = String::from_utf8_lossy(&out.stdout).lines().next() {
                 let p = line.trim();
@@ -58,7 +71,7 @@ pub fn detect_ffprobe() -> Option<String> {
 }
 
 fn via_ffprobe(ffprobe: &str, path: &Path) -> Option<i64> {
-    let out = Command::new(ffprobe)
+    let out = hidden(ffprobe)
         .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"])
         .arg(path)
         .output()
@@ -101,59 +114,77 @@ struct Progress {
     found: usize,
 }
 
-/// Background job: fill in durations for episodes that have none.
+/// Background job: fill in durations for episodes that have none. Asking
+/// while it runs is not an error; the running job makes one more pass.
 pub fn probe_missing(app: AppHandle) -> Result<(), String> {
-    let state = app.state::<AppState>();
-    if state.probing.swap(true, Ordering::SeqCst) {
-        return Err("Duration scan already running".into());
+    if !app.state::<AppState>().probe_job.begin() {
+        tracing::debug!("duration check already running; it will make one more pass");
+        return Ok(());
     }
-    let (configured, items) = {
-        let conn = state.db.lock().map_err(|e| e.to_string())?;
+    // Everything happens on this thread, including finding ffprobe, which
+    // spawns `where` and walks the WinGet package tree: slow enough on
+    // Windows to stall the main thread, where synchronous commands run.
+    std::thread::spawn(move || {
+        let state = app.state::<AppState>();
+        let _release = state.probe_job.release_on_panic();
+        loop {
+            probe_pass(&app);
+            if !state.probe_job.another_pass() {
+                break;
+            }
+        }
+    });
+    Ok(())
+}
+
+fn probe_pass(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let loaded = state.db.lock().map_err(|e| e.to_string()).and_then(|conn| {
         let configured = db::get_setting(&conn, "ffprobe_path").map_err(|e| e.to_string())?;
-        (configured, db::episodes_missing_duration(&conn).map_err(|e| e.to_string())?)
+        Ok((configured, db::episodes_missing_duration(&conn).map_err(|e| e.to_string())?))
+    });
+    let (configured, items) = match loaded {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("duration probe could not read the library: {e}");
+            (None, Vec::new())
+        }
     };
     // Nothing to do: don't go looking for ffprobe at all. This is the common
     // case after a scan, and it used to cost a subprocess every time.
     if items.is_empty() {
-        state.probing.store(false, Ordering::SeqCst);
         let _ = app.emit("durations-done", Progress { done: 0, total: 0, found: 0 });
-        return Ok(());
+        return;
     }
-    // Detection runs outside the lock. It spawns `where` and walks the WinGet
-    // package tree, which takes long enough on Windows to stall every
-    // synchronous command, and those run on the main thread.
     let ffprobe = configured.filter(|p| !p.is_empty() && Path::new(p).exists()).or_else(detect_ffprobe_cached);
-    std::thread::spawn(move || {
-        let total = items.len();
-        let mut found = 0;
-        for (i, (id, path)) in items.iter().enumerate() {
-            let p = Path::new(path);
-            if !p.exists() {
-                continue;
-            }
-            match duration_of(p, ffprobe.as_deref()) {
-                Some(d) => {
-                    let state = app.state::<AppState>();
-                    let guard = state.db.lock();
-                    if let Ok(conn) = guard {
-                        let _ = db::set_duration(&conn, *id, d);
-                        found += 1;
-                    }
-                }
-                None => {
-                    let state = app.state::<AppState>();
-                    let guard = state.db.lock();
-                    if let Ok(conn) = guard {
-                        let _ = db::mark_duration_checked(&conn, *id);
-                    }
+    let total = items.len();
+    tracing::info!(files = total, ffprobe = ffprobe.as_deref().unwrap_or("none (MKV and MP4 only)"), "duration check starting");
+    let started = std::time::Instant::now();
+    let mut found = 0;
+    for (i, (id, path)) in items.iter().enumerate() {
+        let p = Path::new(path);
+        if !p.exists() {
+            continue;
+        }
+        match duration_of(p, ffprobe.as_deref()) {
+            Some(d) => {
+                let guard = state.db.lock();
+                if let Ok(conn) = guard {
+                    let _ = db::set_duration(&conn, *id, d);
+                    found += 1;
                 }
             }
-            if i % 10 == 0 {
-                let _ = app.emit("durations-progress", Progress { done: i, total, found });
+            None => {
+                let guard = state.db.lock();
+                if let Ok(conn) = guard {
+                    let _ = db::mark_duration_checked(&conn, *id);
+                }
             }
         }
-        let _ = app.emit("durations-done", Progress { done: total, total, found });
-        app.state::<AppState>().probing.store(false, Ordering::SeqCst);
-    });
-    Ok(())
+        if i % 10 == 0 {
+            let _ = app.emit("durations-progress", Progress { done: i, total, found });
+        }
+    }
+    tracing::info!(files = total, found, ms = started.elapsed().as_millis() as u64, "duration check finished");
+    let _ = app.emit("durations-done", Progress { done: total, total, found });
 }

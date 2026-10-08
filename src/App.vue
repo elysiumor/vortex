@@ -117,11 +117,10 @@ function reloadViews() {
   refreshDupCount();
 }
 
-async function onScanned() {
+// Posters and durations for new files are started by the backend when a scan
+// changes something; asking again from here only collided with a running job.
+function onScanned() {
   refreshAll();
-  const s = await api.getSettings();
-  if (s.tmdb_key) api.fetchPosters(false).catch(() => {});
-  api.probeDurations().catch(() => {});
 }
 
 // ---- "Up next" countdown after an episode finishes with the player closed ----
@@ -164,6 +163,8 @@ function onKey(e: KeyboardEvent) {
     e.preventDefault();
     el?.focus();
   } else if (e.key === "Escape") {
+    // A dialog or menu closes itself on Escape; don't also leave the page.
+    if ((e.target as HTMLElement)?.closest?.('[role="dialog"],[role="alertdialog"],[role="menu"],[role="listbox"]')) return;
     if (document.activeElement === el) {
       search.value = "";
       el?.blur();
@@ -189,7 +190,8 @@ onMounted(async () => {
   }));
   unlisteners.push(await api.onScanDone((p) => {
     const s = p.stats;
-    if (s.added || s.removed || s.renamed) {
+    // Settings reports its own scans.
+    if (p.reason !== "manual" && (s.added || s.removed || s.renamed)) {
       const parts: string[] = [];
       if (s.added) parts.push(`${s.added} added`);
       if (s.renamed) parts.push(`${s.renamed} renamed`);
@@ -210,10 +212,12 @@ onMounted(async () => {
     await downloadsRef.value?.streamFrom(m);
   };
   unlisteners.push(await api.onOpenUrl(openMagnet));
-  for (const m of await api.pendingOpenUrls()) await openMagnet(m);
   unlisteners.push(await api.onTorrentDone((p) => {
     toast.success(p.moved.length ? `Download finished: ${p.name}` : `Download finished: ${p.name} (files stayed in .incomplete)`);
   }));
+  // Last: a stream can buffer for a minute and may fail, and nothing above
+  // should wait on it.
+  for (const m of await api.pendingOpenUrls()) await openMagnet(m);
 });
 onUnmounted(() => {
   clearTimeout(refreshTimer);

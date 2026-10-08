@@ -96,10 +96,18 @@ pub fn restore(app: &AppHandle, src: &Path) -> Result<(), String> {
         }
     }
 
+    // Background jobs hold their own connections, which keep the file open
+    // (the swap then fails on Windows) and would write the old database's ids
+    // into the new one.
+    let state = app.state::<AppState>();
+    if state.scan_job.is_running() || state.fetch_job.is_running() || state.probe_job.is_running() {
+        let _ = std::fs::remove_file(&incoming);
+        return Err("A library scan, poster fetch or duration check is running. Try again when it finishes.".into());
+    }
+
     // Swap the live database under the lock so nothing else touches it mid-way.
     let live = dir.join("vortex.db");
     {
-        let state = app.state::<AppState>();
         let mut guard = state.db.lock().map_err(|e| e.to_string())?;
         let old = std::mem::replace(&mut *guard, Connection::open_in_memory().map_err(|e| e.to_string())?);
         drop(old);
@@ -108,10 +116,34 @@ pub fn restore(app: &AppHandle, src: &Path) -> Result<(), String> {
         }
         let keep_old = dir.join("vortex.db.before-restore");
         let _ = std::fs::remove_file(&keep_old);
-        let _ = std::fs::rename(&live, &keep_old);
-        std::fs::rename(&incoming, &live).map_err(|e| format!("could not replace database: {e}"))?;
-        *guard = db::open(&live).map_err(|e| e.to_string())?;
+        let swapped = (|| {
+            std::fs::rename(&live, &keep_old).map_err(|e| format!("could not set the current database aside: {e}"))?;
+            if let Err(e) = std::fs::rename(&incoming, &live) {
+                let _ = std::fs::rename(&keep_old, &live);
+                return Err(format!("could not replace database: {e}"));
+            }
+            db::open(&live).map_err(|e| {
+                let _ = std::fs::remove_file(&live);
+                let _ = std::fs::rename(&keep_old, &live);
+                e.to_string()
+            })
+        })();
+        match swapped {
+            Ok(conn) => *guard = conn,
+            Err(e) => {
+                // Back onto the database that was there before. Leaving the
+                // empty stand-in in place made every later command fail with
+                // "no such table" until a restart.
+                if let Ok(conn) = db::open(&live) {
+                    *guard = conn;
+                }
+                let _ = std::fs::remove_file(&incoming);
+                tracing::error!("restore failed, kept the current library: {e}");
+                return Err(e);
+            }
+        }
     }
+    tracing::info!(from = %src.display(), "backup restored");
 
     // Posters: overwrite whatever the zip has; leave other cached images alone.
     let posters_dir = dir.join("posters");

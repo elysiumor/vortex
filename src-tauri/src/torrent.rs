@@ -268,10 +268,21 @@ fn hide(p: &Path) {
 #[cfg(not(windows))]
 fn hide(_p: &Path) {}
 
+/// True for a torrent's own staging folder, `<save in>\.incomplete\<hash>`.
+/// Torrents added before those existed write straight into `.incomplete`.
+fn is_own_staging(p: &Path) -> bool {
+    p.parent().and_then(|d| d.file_name()).map(|n| n == STAGING_DIR).unwrap_or(false)
+}
+
 /// Drop the staging folder once the last torrent has left it. Fails harmlessly
 /// while others are still downloading, and `make_staging` recreates it.
 fn tidy_staging(staging: &Path) {
-    if staging.file_name().map(|n| n == STAGING_DIR).unwrap_or(false) {
+    if is_own_staging(staging) {
+        let _ = std::fs::remove_dir(staging);
+        if let Some(parent) = staging.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    } else if staging.file_name().map(|n| n == STAGING_DIR).unwrap_or(false) {
         let _ = std::fs::remove_dir(staging);
     }
 }
@@ -383,7 +394,14 @@ impl Engine {
         for h in handles {
             let ephemeral = engine.dest_for(&h.info_hash().as_string()).map(|d| d.ephemeral).unwrap_or(false);
             if ephemeral {
-                let _ = engine.rt().block_on(engine.session.pause(&h));
+                // Once initialised: librqbit drops a pause asked for during the
+                // initial check, and the stream then downloaded in the background.
+                let session = engine.session.clone();
+                engine.rt().spawn(async move {
+                    if h.wait_until_initialized().await.is_ok() {
+                        let _ = session.pause(&h).await;
+                    }
+                });
             } else {
                 engine.watch(app.clone(), h);
             }
@@ -434,6 +452,12 @@ impl Engine {
     /// Resolve the file list without starting a download. For magnets this
     /// fetches the metadata from peers, which can take a while.
     pub fn inspect(&self, source: &str) -> Result<Preview, String> {
+        // librqbit answers a list-only request before checking whether it
+        // already has the torrent, so ask the session directly. Saves a
+        // metadata fetch that could only end in "already added".
+        if self.managed_id(source).is_some() {
+            return Err("This torrent is already in your downloads.".into());
+        }
         let add = self.to_add(source)?;
         let opts = AddTorrentOptions { list_only: true, ..Default::default() };
         // A magnet with no reachable peers never resolves, so bound the wait
@@ -471,6 +495,26 @@ impl Engine {
             AddTorrentResponse::AlreadyManaged(..) => Err("This torrent is already in your downloads.".into()),
             AddTorrentResponse::Added(..) => Err("unexpected: torrent started".into()),
         }
+    }
+
+    /// Unpause if the torrent is really paused. `is_paused()` can say so for
+    /// a torrent that went live anyway, and unpausing that one fails.
+    fn ensure_running(&self, t: &Arc<ManagedTorrent>) -> Result<(), String> {
+        if !matches!(t.stats().state, TorrentStatsState::Paused) {
+            return Ok(());
+        }
+        match self.rt().block_on(self.session.unpause(t)) {
+            Ok(()) => Ok(()),
+            Err(_) if matches!(t.stats().state, TorrentStatsState::Live) => Ok(()),
+            Err(e) => Err(anyhow_str(e)),
+        }
+    }
+
+    /// The session's id for this magnet or .torrent, if it is already added.
+    fn managed_id(&self, source: &str) -> Option<usize> {
+        let hash = source_hash(source)?;
+        let key = TorrentIdOrHash::parse(&hash).ok()?;
+        self.session.get(key).map(|t| t.id())
     }
 
     fn remember_dest(&self, info_hash: &str, dest: Option<Dest>) {
@@ -522,6 +566,17 @@ impl Engine {
         // Pieces are written under `<save in>\.incomplete` so the scanner
         // never sees a half-finished file, whichever drive the user picked.
         let staging = make_staging(&save_in)?;
+        // Each torrent gets a folder of its own, named by info hash. Sharing
+        // one let torrents with the same names inside (Subs\, Sample\, a
+        // tracker's .txt) write into, and delete, each other's files.
+        let staging = match source_hash(source) {
+            Some(hash) => {
+                let own = staging.join(hash);
+                std::fs::create_dir_all(&own).map_err(|e| format!("cannot create {}: {e}", own.display()))?;
+                own
+            }
+            None => staging,
+        };
 
         let add = self.to_add(source)?;
         let opts = AddTorrentOptions {
@@ -625,17 +680,26 @@ impl Engine {
         }
 
         let mut failed: Vec<String> = Vec::new();
-        for top in &tops {
-            let p = from.join(top);
-            let outcome = if p.is_dir() {
-                std::fs::remove_dir_all(&p)
-            } else if p.is_file() {
-                std::fs::remove_file(&p)
-            } else {
-                Ok(()) // librqbit already took it
-            };
-            if let Err(e) = outcome {
-                failed.push(format!("{}: {e}", p.display()));
+        if is_own_staging(&from) {
+            // The whole folder is this torrent's, unselected placeholders included.
+            if from.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&from) {
+                    failed.push(format!("{}: {e}", from.display()));
+                }
+            }
+        } else {
+            for top in &tops {
+                let p = from.join(top);
+                let outcome = if p.is_dir() {
+                    std::fs::remove_dir_all(&p)
+                } else if p.is_file() {
+                    std::fs::remove_file(&p)
+                } else {
+                    Ok(()) // librqbit already took it
+                };
+                if let Err(e) = outcome {
+                    failed.push(format!("{}: {e}", p.display()));
+                }
             }
         }
         tidy_staging(&from);
@@ -811,14 +875,7 @@ impl Engine {
             }
         }
         // Already added (streamed before, or downloading): just play it.
-        let existing = self.rt().block_on(async {
-            let add = self.to_add(source).ok()?;
-            match self.session.add_torrent(add, Some(AddTorrentOptions { list_only: true, ..Default::default() })).await {
-                Ok(AddTorrentResponse::AlreadyManaged(id, _)) => Some(id),
-                _ => None,
-            }
-        });
-        let id = match existing {
+        let id = match self.managed_id(source) {
             Some(id) => id,
             None => {
                 let preview = self.inspect(source)?;
@@ -844,9 +901,7 @@ impl Engine {
     /// buffering first. Used by "Stream" and by the row's Play button.
     pub fn stream_existing(self: &Arc<Self>, app: &AppHandle, id: usize) -> Result<StreamStarted, String> {
         let t = self.session.get(TorrentIdOrHash::Id(id)).ok_or("torrent not found")?;
-        if t.is_paused() {
-            self.rt().block_on(self.session.unpause(&t)).map_err(anyhow_str)?;
-        }
+        self.ensure_running(&t)?;
         self.rt().block_on(t.wait_until_initialized()).map_err(anyhow_str)?;
         let only = t.only_files();
         let file = t
@@ -891,15 +946,17 @@ impl Engine {
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
 
-        let dest = self.dest_for(&hash);
-        let start_secs = dest.as_ref().map(|d| d.position_secs).unwrap_or(0);
-        let ephemeral = dest.as_ref().map(|d| d.ephemeral).unwrap_or(false);
+        let start_secs = self.dest_for(&hash).map(|d| d.position_secs).unwrap_or(0);
         let engine = self.clone();
         let app2 = app.clone();
         let name2 = name.clone();
         let on_end: Box<dyn FnOnce(crate::player::StreamEnd) + Send> = Box::new(move |end| {
             let handle = engine.session.get(TorrentIdOrHash::Id(id));
             let finished = handle.as_ref().map(|t| t.stats().finished).unwrap_or(false);
+            // Read now, not when the stream started: Keep may have been
+            // pressed while the player was open, and pausing a kept download
+            // (then asking "Keep it?" again) undid that.
+            let ephemeral = engine.dest_for(&hash).map(|d| d.ephemeral).unwrap_or(false);
             // A stream nobody has kept stops fetching when the player closes;
             // Keep or Watch starts it again. Downloads carry on regardless.
             if ephemeral && !finished {
@@ -932,11 +989,10 @@ impl Engine {
             d.ephemeral = false;
             self.remember_dest(&hash, Some(d));
         }
-        if t.is_paused() {
-            self.rt().block_on(self.session.unpause(&t)).map_err(anyhow_str)?;
-        }
-        self.watch(app.clone(), t);
-        Ok(())
+        // Watch first: a failed unpause used to return before this, and the
+        // kept download then never moved into the library.
+        self.watch(app.clone(), t.clone());
+        self.ensure_running(&t)
     }
 
     /// Discard a stream: forget it and delete what was downloaded.
@@ -962,9 +1018,7 @@ impl Engine {
                 return Err("This file is not selected for download.".into());
             }
         }
-        if t.is_paused() {
-            self.rt().block_on(self.session.unpause(&t)).map_err(anyhow_str)?;
-        }
+        self.ensure_running(&t)?;
         let base = name.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
         Ok(format!("http://127.0.0.1:{}/torrents/{id}/stream/{file}/{}", self.stream_port, urlencoding::encode(&base)))
     }
@@ -972,15 +1026,29 @@ impl Engine {
     /// When the torrent finishes: forget it, move the files up into the
     /// library folder and let the scanner take it from there.
     fn watch(self: &Arc<Self>, app: AppHandle, t: Arc<ManagedTorrent>) {
-        let engine = self.clone();
+        // Weak, because this task runs on the engine's own runtime: a strong
+        // reference made a cycle (engine, runtime, task, engine) that kept
+        // every stopped engine alive after Apply in Settings, with its threads
+        // and its paused torrents' open files.
+        let weak = Arc::downgrade(self);
         self.rt().spawn(async move {
-            if t.wait_until_completed().await.is_err() {
-                return; // removed before it finished
-            }
             let id = t.id();
-            if engine.session.get(TorrentIdOrHash::Id(id)).is_none() {
-                return;
+            // Polled. librqbit's `wait_until_completed` waits on the live state
+            // that exists when it is called, and pausing replaces that state,
+            // so a download paused and resumed once never moved into the library.
+            loop {
+                let Some(engine) = weak.upgrade() else { return };
+                if engine.session.get(TorrentIdOrHash::Id(id)).is_none() {
+                    return; // removed before it finished
+                }
+                let s = t.stats();
+                if s.finished && matches!(s.state, TorrentStatsState::Live) {
+                    break;
+                }
+                drop(engine);
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
+            let Some(engine) = weak.upgrade() else { return };
             let name = t.name().unwrap_or_default();
             // A stream stays put until the user keeps it; `keep` re-arms this watcher.
             if engine.dest_for(&t.info_hash().as_string()).map(|d| d.ephemeral).unwrap_or(false) {
@@ -998,6 +1066,12 @@ impl Engine {
             // Forget (keep files) so nothing holds the files open while they move.
             let _ = engine.session.delete(TorrentIdOrHash::Id(id), false).await;
             let (moved, root) = move_finished(&from, &tops, &dest);
+            tracing::info!(name = %name, moved = moved.len(), of = tops.len(), "download finished");
+            // Everything selected made it out: what is left in the torrent's own
+            // folder is placeholders for files it never downloaded.
+            if is_own_staging(&from) && !tops.is_empty() && moved.len() == tops.len() {
+                let _ = std::fs::remove_dir_all(&from);
+            }
             tidy_staging(&from);
             // Remember where it went, so streaming the same link later plays
             // the finished file instead of fetching it again.
@@ -1058,10 +1132,12 @@ fn move_finished(from: &Path, tops: &[PathBuf], dest: &Dest) -> (Vec<String>, Op
     let save_in = PathBuf::from(&dest.save_in);
     let Some(folder_name) = dest.subfolder.as_deref() else {
         let moved = move_entries(from, tops, &save_in);
+        // Several loose entries have no single home; recording the library
+        // folder itself made a later stream of the same link play the largest
+        // video anywhere in the library.
         let root = match moved.as_slice() {
             [one] => Some(save_in.join(one)),
-            [] => None,
-            _ => Some(save_in),
+            _ => None,
         };
         return (moved, root);
     };

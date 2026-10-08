@@ -2,9 +2,10 @@
 import { onMounted, onUnmounted, ref } from "vue";
 import { toast } from "vue-sonner";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { FolderPlus, HardDrive, RefreshCw, Trash2, Check, Download, Upload, Sun, Moon, Monitor, KeyRound, Power, FileText, FolderOpen } from "@lucide/vue";
+import { FolderPlus, HardDrive, RefreshCw, Trash2, Check, Download, Upload, Sun, Moon, Monitor, KeyRound, Power, FileText, FolderOpen, FilePen } from "@lucide/vue";
 import { api, type DetectedPlayer, type Drive, type Library, type PosterProgress, type ScanStats, type TorrentStatus } from "../lib/api";
 import { applyTheme, loadTheme, type Theme } from "../lib/theme";
+import RenameDialog from "./RenameDialog.vue";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
@@ -42,14 +43,17 @@ const ignoreDirs = ref("");
 const defaultIgnored = ref<string[]>([]);
 const gb = (b: number) => `${(b / 1073741824).toFixed(0)} GB`;
 
+// Only the list: a full load() would also reset unsaved fields elsewhere on
+// the page, such as a proxy typed into Downloads but not yet applied.
+async function loadLibraries() { libraries.value = await api.listLibraries(); }
 async function addFolder() {
   const picked = await open({ directory: true, multiple: false, title: "Choose a folder with movies or series" });
   if (!picked) return;
-  await api.addLibrary(picked as string);
-  await load();
+  try { await api.addLibrary(picked as string); } catch (e) { toast.error(String(e)); return; }
+  await loadLibraries();
   await scan();
 }
-async function remove(lib: Library) { await api.removeLibrary(lib.id); await load(); emit("scanned"); }
+async function remove(lib: Library) { await api.removeLibrary(lib.id); await loadLibraries(); emit("scanned"); }
 async function scan() {
   scanning.value = true;
   try { lastScan.value = await api.scanLibraries(); emit("scanned"); const s = lastScan.value; toast.success(`Scan done: ${s.files_seen} files, ${s.added} added, ${s.removed} removed`); }
@@ -57,10 +61,15 @@ async function scan() {
 }
 async function openDrives() { drives.value = await api.listDrives(); showDrives.value = true; }
 const isSystemDrive = (d: Drive) => d.path.toUpperCase().startsWith("C:");
-async function addDrive(d: Drive) { if (isSystemDrive(d)) { systemDrivePending.value = d; return; } await reallyAddDrive(d); }
+// The confirm dialog clears systemDrivePending as it closes, which can happen
+// before its button's handler runs; hold the drive where closing cannot touch it.
+let driveTarget: Drive | null = null;
+async function addDrive(d: Drive) { if (isSystemDrive(d)) { driveTarget = d; systemDrivePending.value = d; return; } await reallyAddDrive(d); }
+async function confirmSystemDrive() { const d = driveTarget; driveTarget = null; if (d) await reallyAddDrive(d); }
 async function reallyAddDrive(d: Drive) {
   systemDrivePending.value = null; showDrives.value = false;
-  await api.addLibrary(d.path); await load();
+  try { await api.addLibrary(d.path); } catch (e) { toast.error(String(e)); return; }
+  await loadLibraries();
   toast(`Added ${d.path}. Scanning in the background…`);
   await scan();
 }
@@ -89,6 +98,16 @@ async function connectTmdb() {
   catch (e) { tmdbStatus.value = String(e); } finally { tmdbBusy.value = false; }
 }
 async function removeTmdb() { await api.disconnectTmdb(); tmdbMasked.value = null; confirmRemove.value = false; toast("TMDB key removed. Existing posters are kept."); }
+// ---- rename to TMDb names ----
+const renameOpen = ref(false);
+const canUndoRename = ref(false);
+async function refreshUndo() { canUndoRename.value = await api.renameCanUndo().catch(() => false); }
+async function afterRename() { await refreshUndo(); emit("scanned"); }
+async function undoRename() {
+  try { const n = await api.renameUndo(); toast(`Rename undone (${n} change${n === 1 ? "" : "s"} reversed)`); }
+  catch (e) { toast.error(String(e)); }
+  await afterRename();
+}
 async function fetchPosters(force: boolean) { try { fetching.value = true; posterProgress.value = null; await api.fetchPosters(force); } catch (e) { fetching.value = false; toast.error(String(e)); } }
 
 // ---- player ----
@@ -149,11 +168,16 @@ async function backupNow() {
   try { const info = await api.createBackup(dest); lastBackup.value = stamp; lastBackupPath.value = info.path; toast.success(`Backup saved: ${(info.bytes / 1048576).toFixed(1)} MB, ${info.posters} images`); }
   catch (e) { toast.error(String(e)); } finally { backupBusy.value = false; }
 }
-async function pickRestore() { const src = await open({ multiple: false, filters: [{ name: "Vortex backup", extensions: ["zip"] }] }); if (src) restorePending.value = src as string; }
+// Same closing race as the drive dialog: hold the file outside the ref.
+let restoreTarget: string | null = null;
+async function pickRestore() { const src = await open({ multiple: false, filters: [{ name: "Vortex backup", extensions: ["zip"] }] }); if (src) { restoreTarget = src as string; restorePending.value = restoreTarget; } }
 async function confirmRestore() {
-  if (!restorePending.value) return;
+  const src = restoreTarget;
+  restoreTarget = null;
+  restorePending.value = null;
+  if (!src) return;
   backupBusy.value = true;
-  try { await api.restoreBackup(restorePending.value); restorePending.value = null; await load(); emit("scanned"); toast.success("Backup restored"); }
+  try { await api.restoreBackup(src); await load(); emit("scanned"); toast.success("Backup restored"); }
   catch (e) { toast.error(String(e)); } finally { backupBusy.value = false; }
 }
 async function resetWatchData() { await api.resetWatchData(); confirmReset.value = false; emit("scanned"); toast.success("All watch data cleared"); }
@@ -175,22 +199,31 @@ async function load() {
 }
 
 const unlisteners: (() => void)[] = [];
+// Listeners go first: load() makes several slow calls, and leaving the page
+// during them used to run onUnmounted before anything was registered, leaking
+// every listener added afterwards.
+let unmounted = false;
 onMounted(async () => {
-  await load();
-  unlisteners.push(await api.onDurationsDone((p) => { probing.value = false; durationResult.value = p.total === 0 ? "All files already have a duration" : `Read ${p.found} of ${p.total} files`; }));
-  unlisteners.push(await api.onPosterProgress((p) => { fetching.value = true; posterProgress.value = p; }));
+  const keep = (u: () => void) => { if (unmounted) u(); else unlisteners.push(u); };
+  // Background runs (startup, folder watcher) report here too, so the button
+  // shows the probe that is already going instead of offering a second one.
+  keep(await api.onDurationsProgress(() => { probing.value = true; }));
+  keep(await api.onDurationsDone((p) => { probing.value = false; durationResult.value = p.total === 0 ? "All files already have a duration" : `Read ${p.found} of ${p.total} files`; }));
+  keep(await api.onPosterProgress((p) => { fetching.value = true; posterProgress.value = p; }));
   // Deliberately no emit("scanned") here. That runs onScanned, which starts
   // another poster fetch, which finishes and lands back on this handler: an
   // endless loop of fetches and toasts. App.vue already refreshes the views on
   // this same event.
-  unlisteners.push(await api.onPostersDone((p) => {
+  keep(await api.onPostersDone((p) => {
     fetching.value = false;
     posterProgress.value = p;
     if (p.current) toast.error(`Poster fetch stopped: ${p.current}`);
     else if (p.total > 0) toast(`Posters: ${p.matched} of ${p.total} matched`);
   }));
+  if (!unmounted) await load();
+  if (!unmounted) await refreshUndo();
 });
-onUnmounted(() => unlisteners.forEach((u) => u()));
+onUnmounted(() => { unmounted = true; unlisteners.forEach((u) => u()); });
 </script>
 
 <template>
@@ -321,8 +354,17 @@ onUnmounted(() => unlisteners.forEach((u) => u()));
           <Progress :model-value="100 * posterProgress.done / posterProgress.total" class="h-1.5" />
           <div class="mt-1 text-xs text-muted-foreground">{{ posterProgress.done }} / {{ posterProgress.total }} · {{ posterProgress.matched }} matched<span v-if="fetching && posterProgress.current"> · {{ posterProgress.current }}</span></div>
         </div>
+        <div v-if="tmdbMasked" class="flex flex-wrap items-center gap-2 border-t pt-3">
+          <div class="min-w-0 flex-1">
+            <div class="text-sm font-medium">Rename files to TMDb names</div>
+            <div class="text-xs text-muted-foreground">Movies like Inception (2010).mkv, episodes like Dark (2017) - S01E01 - Secrets.mkv, anime included. You see every change first.</div>
+          </div>
+          <Button size="sm" variant="outline" @click="renameOpen = true"><FilePen /> Review renames…</Button>
+          <Button size="sm" variant="ghost" :disabled="!canUndoRename" @click="undoRename">Undo last rename</Button>
+        </div>
       </CardContent>
     </Card>
+    <RenameDialog v-model:open="renameOpen" :ids="null" @done="afterRename" />
 
     <Card>
       <CardHeader><CardTitle>File durations</CardTitle><CardDescription>MKV, WebM, MP4, M4V and MOV are read directly. For AVI, WMV, TS and others, point to ffprobe.exe from FFmpeg.</CardDescription></CardHeader>
@@ -373,7 +415,7 @@ onUnmounted(() => unlisteners.forEach((u) => u()));
         <AlertDialogFooter>
           <AlertDialogCancel>Cancel</AlertDialogCancel>
           <Button variant="outline" @click="systemDrivePending = null; showDrives = false; addFolder()">Pick a folder instead</Button>
-          <AlertDialogAction @click="reallyAddDrive(systemDrivePending!)">Add whole drive</AlertDialogAction>
+          <AlertDialogAction @click="confirmSystemDrive">Add whole drive</AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>

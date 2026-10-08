@@ -2,7 +2,7 @@ use crate::db::{self, MediaItem};
 use crate::AppState;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -164,6 +164,27 @@ struct SeasonEpisode {
     air_date: Option<String>,
     still_path: Option<String>,
     vote_average: Option<f64>,
+}
+
+/// Episode names of one TMDb season, by episode number. Used when renaming
+/// anime numbered straight through, whose later episodes never matched a
+/// season in `fetch_episode_titles`.
+pub fn season_names(app: &AppHandle, tmdb_id: i64, season: i32) -> Result<std::collections::HashMap<i32, String>, String> {
+    let key = {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        db::get_setting(&conn, "tmdb_key").map_err(|e| e.to_string())?.unwrap_or_default()
+    };
+    if key.trim().is_empty() {
+        return Err("Add your TMDB API key in Settings first".into());
+    }
+    let req = client().get(format!("{API}/tv/{tmdb_id}/season/{season}")).query(&[("language", LANG)]);
+    let resp = auth(req, &key).send().map_err(|e| format!("TMDB request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("TMDB returned HTTP {}", resp.status()));
+    }
+    let body: SeasonResponse = resp.json().map_err(|e| format!("bad TMDB response: {e}"))?;
+    Ok(body.episodes.into_iter().filter_map(|e| Some((e.episode_number, e.name.filter(|n| !n.trim().is_empty())?))).collect())
 }
 
 /// Fetch episode names for every season present in the library for this
@@ -642,21 +663,39 @@ fn download_poster(poster: &str, dest: &Path) -> Result<(), String> {
 /// Apply a chosen match to an item: download the poster and store metadata.
 pub fn apply_match(app: &AppHandle, media_item_id: i64, m: &TmdbMatch) -> Result<(), String> {
     let mut poster_file: Option<String> = None;
+    let mut poster_failed = false;
     if let Some(p) = &m.poster {
         let dest = posters_dir(app)?.join(format!("{media_item_id}.jpg"));
-        download_poster(p, &dest)?;
-        poster_file = Some(dest.to_string_lossy().to_string());
+        // The image is the least of what a match brings. A failed download
+        // used to discard the match too, so the title was searched again on
+        // every run; now the match stays and only the poster is retried.
+        match download_poster(p, &dest) {
+            Ok(()) => poster_file = Some(dest.to_string_lossy().to_string()),
+            Err(e) => {
+                tracing::warn!(media_item_id, "poster download failed: {e}");
+                poster_failed = true;
+            }
+        }
     }
     let state = app.state::<AppState>();
-    {
+    let (kind, key) = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
         db::set_tmdb(&conn, media_item_id, Some(m.tmdb_id), poster_file.as_deref(), m.overview.as_deref(), m.rating)
             .map_err(|e| e.to_string())?;
+        if poster_failed {
+            // Leave it for the next "Fetch missing posters" to try again.
+            db::clear_poster_checked(&conn, media_item_id).map_err(|e| e.to_string())?;
+        }
         let kind: String = conn
             .query_row("SELECT kind FROM media_items WHERE id = ?1", [media_item_id], |r| r.get(0))
             .map_err(|e| e.to_string())?;
         let key = db::get_setting(&conn, "tmdb_key").map_err(|e| e.to_string())?.unwrap_or_default();
-        if let Some(g) = genre_names(&key, &kind, &m.genre_ids) {
+        (kind, key)
+    };
+    // Outside the lock: the genre list is a network request with a 20 s
+    // timeout, and every synchronous command waits on that lock.
+    if let Some(g) = genre_names(&key, &kind, &m.genre_ids) {
+        if let Ok(conn) = state.db.lock() {
             let _ = db::set_item_genres(&conn, media_item_id, Some(&g));
         }
     }
@@ -674,53 +713,87 @@ struct Progress {
     current: String,
 }
 
+/// A forced request ("Retry unmatched") that arrived while a normal pass
+/// was running; the next pass honours it.
+static FORCE_NEXT: AtomicBool = AtomicBool::new(false);
+
 /// Background job: find posters for every item that has none.
 /// `force` also retries items that were checked before and found nothing.
+/// Asking while it runs is not an error; the running job makes one more pass,
+/// which picks up titles added since it started.
 pub fn fetch_missing(app: AppHandle, force: bool) -> Result<(), String> {
     let state = app.state::<AppState>();
-    if state.fetching.swap(true, Ordering::SeqCst) {
-        return Err("A poster fetch is already running".into());
-    }
-    let (key, items) = {
+    let key = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
-        let key = db::get_setting(&conn, "tmdb_key").map_err(|e| e.to_string())?.unwrap_or_default();
-        let items = db::items_missing_poster(&conn, force).map_err(|e| e.to_string())?;
-        (key, items)
+        db::get_setting(&conn, "tmdb_key").map_err(|e| e.to_string())?.unwrap_or_default()
     };
     if key.trim().is_empty() {
-        state.fetching.store(false, Ordering::SeqCst);
         return Err("Add your TMDB API key in Settings first".into());
     }
-
+    if force {
+        FORCE_NEXT.store(true, Ordering::SeqCst);
+    }
+    if !state.fetch_job.begin() {
+        tracing::debug!(force, "poster fetch already running; it will make one more pass");
+        return Ok(());
+    }
     std::thread::spawn(move || {
-        let total = items.len();
-        let mut matched = 0;
-        for (i, item) in items.iter().enumerate() {
-            let _ = app.emit("posters-progress", Progress { done: i, total, matched, current: item.title.clone() });
-            match best_match(&key, item) {
-                Ok(Some(m)) => {
-                    if apply_match(&app, item.id, &m).is_ok() {
-                        matched += 1;
-                    }
-                }
-                Ok(None) => {
-                    let state = app.state::<AppState>();
-                    let guard = state.db.lock();
-                    if let Ok(conn) = guard {
-                        let _ = db::mark_poster_checked(&conn, item.id);
-                    }
-                }
-                Err(e) => {
-                    // Auth or network failure: stop the whole run rather than hammer the API.
-                    let _ = app.emit("posters-done", Progress { done: i, total, matched, current: e });
-                    app.state::<AppState>().fetching.store(false, Ordering::SeqCst);
-                    return;
-                }
+        let state = app.state::<AppState>();
+        let _release = state.fetch_job.release_on_panic();
+        loop {
+            fetch_pass(&app, FORCE_NEXT.swap(false, Ordering::SeqCst));
+            if !state.fetch_job.another_pass() {
+                break;
             }
-            std::thread::sleep(Duration::from_millis(120)); // stay well under TMDB's rate limit
         }
-        let _ = app.emit("posters-done", Progress { done: total, total, matched, current: String::new() });
-        app.state::<AppState>().fetching.store(false, Ordering::SeqCst);
     });
     Ok(())
+}
+
+fn fetch_pass(app: &AppHandle, force: bool) {
+    let state = app.state::<AppState>();
+    let loaded = state.db.lock().map_err(|e| e.to_string()).and_then(|conn| {
+        let key = db::get_setting(&conn, "tmdb_key").map_err(|e| e.to_string())?.unwrap_or_default();
+        Ok((key, db::items_missing_poster(&conn, force).map_err(|e| e.to_string())?))
+    });
+    let (key, items) = match loaded {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("poster fetch could not read the library: {e}");
+            let _ = app.emit("posters-done", Progress { done: 0, total: 0, matched: 0, current: e });
+            return;
+        }
+    };
+    let total = items.len();
+    let mut matched = 0;
+    tracing::info!(titles = total, force, "poster fetch starting");
+    let started = std::time::Instant::now();
+    for (i, item) in items.iter().enumerate() {
+        let _ = app.emit("posters-progress", Progress { done: i, total, matched, current: item.title.clone() });
+        match best_match(&key, item) {
+            Ok(Some(m)) => match apply_match(app, item.id, &m) {
+                Ok(()) => {
+                    tracing::debug!(title = %item.title, tmdb_id = m.tmdb_id, "matched");
+                    matched += 1;
+                }
+                Err(e) => tracing::warn!(title = %item.title, tmdb_id = m.tmdb_id, "match not saved: {e}"),
+            },
+            Ok(None) => {
+                tracing::debug!(title = %item.title, year = ?item.year, "no TMDB match");
+                let guard = state.db.lock();
+                if let Ok(conn) = guard {
+                    let _ = db::mark_poster_checked(&conn, item.id);
+                }
+            }
+            Err(e) => {
+                // Auth or network failure: stop the whole run rather than hammer the API.
+                tracing::warn!(at = %item.title, done = i, of = total, matched, "poster fetch stopped: {e}");
+                let _ = app.emit("posters-done", Progress { done: i, total, matched, current: e });
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(120)); // stay well under TMDB's rate limit
+    }
+    tracing::info!(titles = total, matched, ms = started.elapsed().as_millis() as u64, "poster fetch finished");
+    let _ = app.emit("posters-done", Progress { done: total, total, matched, current: String::new() });
 }

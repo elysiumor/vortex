@@ -7,6 +7,7 @@ mod logging;
 mod parser;
 mod player;
 mod probe;
+mod rename;
 mod scanner;
 mod tmdb;
 mod torrent;
@@ -14,7 +15,6 @@ mod tray;
 mod watcher;
 
 use rusqlite::Connection;
-use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 use tauri::{Manager, WindowEvent};
 
@@ -23,10 +23,9 @@ pub struct AppState {
     /// Long jobs open their own connection from here rather than holding
     /// `db` for minutes; SQLite is in WAL mode, so that is safe.
     pub db_path: std::path::PathBuf,
-    pub fetching: AtomicBool,
-    pub probing: AtomicBool,
-    pub scanning: AtomicBool,
-    pub rescan_wanted: AtomicBool,
+    pub fetch_job: jobs::Job,
+    pub probe_job: jobs::Job,
+    pub scan_job: jobs::Job,
     pub torrent: Mutex<Option<std::sync::Arc<torrent::Engine>>>,
     /// Held only while an engine is being created, so readers of `torrent`
     /// are never blocked behind a network-bound startup.
@@ -84,15 +83,15 @@ pub fn run() {
             app.manage(AppState {
                 db: Mutex::new(conn),
                 db_path,
-                fetching: AtomicBool::new(false),
-                probing: AtomicBool::new(false),
-                scanning: AtomicBool::new(false),
-                rescan_wanted: AtomicBool::new(false),
+                fetch_job: jobs::Job::default(),
+                probe_job: jobs::Job::default(),
+                scan_job: jobs::Job::default(),
                 torrent: Mutex::new(None),
                 torrent_start: Mutex::new(()),
             });
 
             let handle = app.handle().clone();
+            logging::startup_summary(&handle);
             tray::build(&handle)?;
             if jobs::setting_on(&handle, "rescan_on_startup", true) {
                 jobs::refresh_async(handle.clone(), "startup");
@@ -142,6 +141,10 @@ pub fn run() {
             commands::reveal_path,
             commands::probe_durations,
             commands::detect_ffprobe,
+            commands::rename_preview,
+            commands::rename_apply,
+            commands::rename_undo,
+            commands::rename_can_undo,
             commands::fetch_posters,
             commands::search_tmdb,
             commands::apply_tmdb_match,
