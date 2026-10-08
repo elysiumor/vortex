@@ -1,6 +1,6 @@
 use crate::db;
 use crate::AppState;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::Path;
@@ -92,18 +92,21 @@ static SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// ends with its own process: VLC leaves its window open when a file ends, and
 /// autoplay opens a new one, so "any vlc.exe still running" kept the old
 /// tracker alive, its final save pending, until every VLC window was closed.
-fn still_tracking(link: &Link, child_gone: bool, seen_playing: bool, my_session: u64, sys: &mut sysinfo::System, exe_name: &str) -> bool {
+/// `own_link`: a per-launch link that belongs to the process we started. A
+/// link adopted from a VLC window that was already open is shared, like a
+/// PotPlayer window, and that window outlives our process.
+fn still_tracking(own_link: bool, child_gone: bool, seen_playing: bool, my_session: u64, sys: &mut sysinfo::System, exe_name: &str) -> bool {
     use std::sync::atomic::Ordering;
     // A per-launch link we never heard from means the file was handed to a
     // player already running (VLC "one instance"); that is as shared as a
     // PotPlayer window, so a newer playback takes over here too.
-    if (!link.per_launch() || !seen_playing) && SESSION.load(Ordering::SeqCst) != my_session {
+    if (!own_link || !seen_playing) && SESSION.load(Ordering::SeqCst) != my_session {
         return false;
     }
     if !child_gone {
         return true;
     }
-    if link.per_launch() && seen_playing {
+    if own_link && seen_playing {
         return false;
     }
     // Single-instance players hand the file to an existing window and exit at
@@ -176,6 +179,46 @@ pub enum Reading {
     Ended,
     /// No answer (player not reachable, still loading, or unsupported).
     Silent,
+    /// The player is playing some other file now: with VLC's "one instance"
+    /// setting a later playback replaces ours in the same window.
+    Elsewhere,
+}
+
+/// The VLC window whose HTTP interface last answered for a file of ours.
+/// With VLC's "one instance" setting a new launch hands its file to that
+/// window and exits, so the new launch's own port never answers; the tracker
+/// carries on through this one instead.
+static LAST_VLC: std::sync::Mutex<Option<(u16, String)>> = std::sync::Mutex::new(None);
+
+fn remember_vlc(link: &Link) {
+    if let Link::VlcHttp { port, password } = link {
+        if let Ok(mut last) = LAST_VLC.lock() {
+            *last = Some((*port, password.clone()));
+        }
+    }
+}
+
+/// After a VLC launch handed its file over: the window that took it, if it
+/// is one Vortex can talk to and it is playing our file.
+fn adopt_running_vlc(link: &Link, expect: &str) -> Option<Link> {
+    let Link::VlcHttp { port: ours, .. } = link else { return None };
+    let (port, password) = LAST_VLC.lock().ok()?.clone()?;
+    if port == *ours {
+        return None;
+    }
+    matches!(read_vlc(port, &password, expect), Reading::Playing { .. }).then_some(Link::VlcHttp { port, password })
+}
+
+/// Whether the player's current file is the one we launched. Compared by
+/// name, ignoring case and URL encoding (a stream's name comes from its URL).
+fn same_file(playing: &str, expect: &str) -> bool {
+    let norm = |s: &str| urlencoding::decode(s).map(|c| c.into_owned()).unwrap_or_else(|_| s.to_string()).to_lowercase();
+    norm(playing) == norm(expect)
+}
+
+/// The last path segment of a file path or URL, as a player names it.
+fn file_name_of(path_or_url: &str) -> String {
+    path_or_url.rsplit(['\\', '/']).next().unwrap_or(path_or_url).to_string()
 }
 
 fn free_port() -> u16 {
@@ -242,14 +285,7 @@ fn build_launch(kind: &str, file: &str, start_secs: i64, subtitle: Option<&str>)
     (args, link)
 }
 
-#[derive(Deserialize)]
-struct VlcStatus {
-    time: Option<f64>,
-    length: Option<f64>,
-    state: Option<String>,
-}
-
-fn read_vlc(port: u16, password: &str) -> Reading {
+fn read_vlc(port: u16, password: &str, expect: &str) -> Reading {
     let resp = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
@@ -258,12 +294,17 @@ fn read_vlc(port: u16, password: &str) -> Reading {
             c.get(format!("http://127.0.0.1:{port}/requests/status.json")).basic_auth("", Some(password)).send().ok()
         });
     let Some(resp) = resp else { return Reading::Silent };
-    let Ok(s) = resp.json::<VlcStatus>() else { return Reading::Silent };
-    if s.state.as_deref() == Some("stopped") {
+    let Ok(v) = resp.json::<serde_json::Value>() else { return Reading::Silent };
+    if v["state"].as_str() == Some("stopped") {
         return Reading::Ended;
     }
-    let len = s.length.filter(|l| *l > 0.0).map(|l| l.round() as i64);
-    match s.time {
+    if let Some(name) = v["information"]["category"]["meta"]["filename"].as_str() {
+        if !expect.is_empty() && !same_file(name, expect) {
+            return Reading::Elsewhere;
+        }
+    }
+    let len = v["length"].as_f64().filter(|l| *l > 0.0).map(|l| l.round() as i64);
+    match v["time"].as_f64() {
         Some(t) => Reading::Playing { pos: t.round() as i64, len },
         None => Reading::Silent,
     }
@@ -300,10 +341,11 @@ fn read_mpv(name: &str) -> Reading {
     Reading::Playing { pos: pos.round() as i64, len }
 }
 
-fn read_link(link: &Link) -> Reading {
+/// `expect`: the name of the file we launched, for players that report theirs.
+fn read_link(link: &Link, expect: &str) -> Reading {
     match link {
         Link::None => Reading::Silent,
-        Link::VlcHttp { port, password } => read_vlc(*port, password),
+        Link::VlcHttp { port, password } => read_vlc(*port, password, expect),
         Link::MpvPipe { name } => read_mpv(name),
         Link::PotWindow => pot::read(),
     }
@@ -363,7 +405,7 @@ pub fn play(app: AppHandle, episode_id: i64) -> Result<bool, String> {
 
     let start = if episode.completed { 0 } else { episode.position_secs };
 
-    let (mut child, exe_name, link) = match (player_kind.as_deref(), player_path.as_deref()) {
+    let (mut child, exe_name, mut link) = match (player_kind.as_deref(), player_path.as_deref()) {
         (Some(kind), Some(path)) if !path.is_empty() && Path::new(path).exists() => {
             // First sidecar subtitle, preferring an English one if several exist.
             let subtitle = episode.subtitles.as_deref().and_then(|s| {
@@ -389,6 +431,8 @@ pub fn play(app: AppHandle, episode_id: i64) -> Result<bool, String> {
 
     let started = Instant::now();
     let mut duration = episode.duration_secs;
+    let expect = file_name_of(&episode.path);
+    let mut adopted = false;
     let my_session = SESSION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     tracing::info!(episode_id, player = %exe_name, start, "playback started");
     std::thread::spawn(move || {
@@ -408,13 +452,26 @@ pub fn play(app: AppHandle, episode_id: i64) -> Result<bool, String> {
                     child_gone = true;
                 }
             }
-            if !still_tracking(&link, child_gone, seen_playing, my_session, &mut sys, &exe_name) {
+            if !still_tracking(link.per_launch() && !adopted, child_gone, seen_playing, my_session, &mut sys, &exe_name) {
                 break;
             }
+            // Our VLC handed the file to a window already open and exited:
+            // follow that window instead of guessing from the clock.
+            if child_gone && !seen_playing && !adopted {
+                if let Some(other) = adopt_running_vlc(&link, &expect) {
+                    tracing::info!(episode_id, "following the VLC window the file was handed to");
+                    link = other;
+                    adopted = true;
+                }
+            }
 
-            match read_link(&link) {
+            match read_link(&link, &expect) {
+                // Another file took over the window: our session ends with the
+                // last position read for our file.
+                Reading::Elsewhere if seen_playing => break,
                 Reading::Playing { pos, len } => {
                     seen_playing = true;
+                    remember_vlc(&link);
                     exact_pos = Some(pos);
                     max_pos = max_pos.max(pos);
                     if duration.is_none() {
@@ -555,7 +612,8 @@ pub fn play_url_tracked(
             return Ok(false);
         }
     };
-    let (args, link) = build_launch(&kind, url, start_secs, None);
+    let (args, mut link) = build_launch(&kind, url, start_secs, None);
+    let expect = file_name_of(url);
     let mut child = Command::new(&path).args(args).spawn().map_err(|e| format!("failed to start player: {e}"))?;
     let Some(on_end) = on_end else { return Ok(true) };
 
@@ -567,6 +625,7 @@ pub fn play_url_tracked(
         let mut exact_pos: Option<i64> = None;
         let mut duration: Option<i64> = None;
         let mut child_gone = false;
+        let mut adopted = false;
         loop {
             std::thread::sleep(Duration::from_secs(2));
             if !child_gone {
@@ -574,14 +633,25 @@ pub fn play_url_tracked(
                     child_gone = true;
                 }
             }
-            if !still_tracking(&link, child_gone, exact_pos.is_some(), my_session, &mut sys, &exe_name) {
+            if !still_tracking(link.per_launch() && !adopted, child_gone, exact_pos.is_some(), my_session, &mut sys, &exe_name) {
                 break;
             }
-            if let Reading::Playing { pos, len } = read_link(&link) {
-                exact_pos = Some(pos);
-                if len.is_some() {
-                    duration = len;
+            if child_gone && exact_pos.is_none() && !adopted {
+                if let Some(other) = adopt_running_vlc(&link, &expect) {
+                    link = other;
+                    adopted = true;
                 }
+            }
+            match read_link(&link, &expect) {
+                Reading::Elsewhere if exact_pos.is_some() => break,
+                Reading::Playing { pos, len } => {
+                    exact_pos = Some(pos);
+                    remember_vlc(&link);
+                    if len.is_some() {
+                        duration = len;
+                    }
+                }
+                _ => {}
             }
         }
         let elapsed = started.elapsed().as_secs() as i64;
@@ -592,4 +662,19 @@ pub fn play_url_tracked(
         });
     });
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// VLC names the file it is playing; a stream's name comes from its URL.
+    #[test]
+    fn the_playing_file_is_recognised() {
+        assert_eq!(file_name_of(r"D:\Media\Dark\Dark - S01E04.mkv"), "Dark - S01E04.mkv");
+        let stream = "http://127.0.0.1:2616/torrents/3/stream/0/Dark%20-%20S01E04.mkv";
+        assert!(same_file("Dark - S01E04.mkv", &file_name_of(stream)), "decoded and encoded names match");
+        assert!(same_file("dark - s01e04.MKV", "Dark - S01E04.mkv"), "case does not matter");
+        assert!(!same_file("Dark - S01E05.mkv", "Dark - S01E04.mkv"), "another episode is another file");
+    }
 }
